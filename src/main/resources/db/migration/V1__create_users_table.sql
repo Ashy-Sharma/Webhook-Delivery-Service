@@ -6,5 +6,6 @@ create table users (
     role varchar(20) not null default 'USER',
     created_at timestamp not null default current_timestamp,
     updated_at timestamp not null default current_timestamp on update current_timestamp,
-    constraint uk_users_email unique (email)
+    constraint uk_users_email unique (email),
+    constraint uk_users_username unique (username)
 );
