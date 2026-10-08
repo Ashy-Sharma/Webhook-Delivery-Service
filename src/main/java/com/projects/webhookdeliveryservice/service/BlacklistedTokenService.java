@@ -4,10 +4,10 @@ import com.projects.webhookdeliveryservice.entity.BlacklistedToken;
 import com.projects.webhookdeliveryservice.repository.BlacklistedTokenRepository;
 import com.projects.webhookdeliveryservice.security.JwtService;
 import com.projects.webhookdeliveryservice.util.HashUtil;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 

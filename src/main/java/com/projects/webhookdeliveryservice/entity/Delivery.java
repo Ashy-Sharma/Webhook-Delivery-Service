@@ -40,7 +40,10 @@ public class Delivery {
     @Column(name = "next_retry_at")
     private Instant nextRetryAt;
 
-    @Column(name = "delivered_At")
+    @Column(name = "claimed_at")
+    private Instant claimedAt;
+
+    @Column(name = "delivered_at")
     private Instant deliveredAt;
 
     @CreationTimestamp

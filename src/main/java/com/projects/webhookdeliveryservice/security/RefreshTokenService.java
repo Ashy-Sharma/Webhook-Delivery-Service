@@ -6,10 +6,10 @@ import com.projects.webhookdeliveryservice.exception.InvalidTokenException;
 import com.projects.webhookdeliveryservice.repository.RefreshTokenRepository;
 import com.projects.webhookdeliveryservice.util.HashUtil;
 import com.projects.webhookdeliveryservice.util.TokenGenerator;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 
