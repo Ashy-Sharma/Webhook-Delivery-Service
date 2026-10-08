@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Function;
 
 @Service
@@ -32,11 +33,13 @@ public class JwtService {
     }
 
     public String generateToken(Map<String, Object> claims, UserDetails userDetails){
+        Instant issuedAt = Instant.now();
         return Jwts.builder()
                 .claims(claims)
+                .id(UUID.randomUUID().toString())
                 .subject(userDetails.getUsername())
-                .issuedAt(Date.from(Instant.now()))
-                .expiration(Date.from(Instant.now().plusMillis(jwtExpiration)))
+                .issuedAt(Date.from(issuedAt))
+                .expiration(Date.from(issuedAt.plusMillis(jwtExpiration)))
                 .signWith(getSigningKey())
                 .compact();
     }

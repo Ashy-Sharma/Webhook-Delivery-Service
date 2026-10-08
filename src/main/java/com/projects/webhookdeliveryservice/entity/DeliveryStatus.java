@@ -5,6 +5,7 @@ public enum DeliveryStatus {
     DELIVERING,
     DELIVERED,
     RETRYING,
-    FAILED
+    FAILED,
+    CANCELLED
 }
 

@@ -16,7 +16,7 @@ public class WebhookResponse {
 
     private Long id;
     private String url;
-    private List<String> eventType;
+    private List<String> eventTypes;
     private String secretKey;
     private String description;
     private Boolean isActive;

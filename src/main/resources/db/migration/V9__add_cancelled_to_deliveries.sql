@@ -1,0 +1,9 @@
+ALTER TABLE deliveries
+    MODIFY COLUMN status ENUM(
+    'PENDING',
+    'DELIVERING',
+    'DELIVERED',
+    'RETRYING',
+    'FAILED',
+    'CANCELLED'
+    ) NOT NULL DEFAULT 'PENDING';

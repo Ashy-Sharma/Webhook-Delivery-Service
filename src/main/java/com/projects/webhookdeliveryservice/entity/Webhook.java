@@ -44,6 +44,9 @@ public class Webhook {
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
 
+    @Column(name = "deleted_at")
+    private Instant deletedAt;
+
     @ManyToOne
     @JoinColumn(name = "owner_id")
     private User owner;

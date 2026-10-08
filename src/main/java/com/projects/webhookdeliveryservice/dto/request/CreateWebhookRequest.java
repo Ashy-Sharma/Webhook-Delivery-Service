@@ -26,7 +26,7 @@ public class CreateWebhookRequest {
     private String url;
 
     @NotEmpty
-    private List<String> eventType;
+    private List<String> eventTypes;
 
     @Length(max = 500)
     private String description;

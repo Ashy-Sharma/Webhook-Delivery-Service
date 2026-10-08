@@ -13,7 +13,7 @@ public class SecretKeyGeneratorUtil {
         byte[] secret = new byte[32]; // 256 bits
         SECURE_RANDOM.nextBytes(secret);
 
-        return Base64.getUrlEncoder()
+        return "whsec_" + Base64.getUrlEncoder()
                 .withoutPadding()
                 .encodeToString(secret);
     }

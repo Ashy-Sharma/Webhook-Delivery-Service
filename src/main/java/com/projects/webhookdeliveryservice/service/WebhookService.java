@@ -1,5 +1,7 @@
 package com.projects.webhookdeliveryservice.service;
 
+import com.projects.webhookdeliveryservice.entity.DeliveryStatus;
+import com.projects.webhookdeliveryservice.repository.DeliveryRepository;
 import tools.jackson.core.JacksonException;
 import com.projects.webhookdeliveryservice.dto.request.CreateWebhookRequest;
 import com.projects.webhookdeliveryservice.dto.request.UpdateWebhookRequest;
@@ -15,6 +17,7 @@ import org.springframework.stereotype.Service;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.ObjectMapper;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -24,6 +27,8 @@ public class WebhookService {
 
     private final WebhookRepository webhookRepository;
     private final ObjectMapper objectMapper;
+    private final DeliveryRepository deliveryRepository;
+    private static final List<DeliveryStatus> OPEN_STATUSES = List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING);
 
     private List<String> deserializeEventTypes(String json) {
         try {
@@ -42,7 +47,7 @@ public class WebhookService {
     }
 
     private Webhook getOwnedWebhookOrThrow(Long id, User user) {
-        return webhookRepository.findByIdAndOwner(id, user)
+        return webhookRepository.findByIdAndOwnerAndDeletedAtIsNull(id, user)
                 .orElseThrow(() -> new ResourceNotFoundException("Webhook not found"));
     }
 
@@ -54,7 +59,7 @@ public class WebhookService {
                 .isActive(webhook.isActive())
                 .createdAt(webhook.getCreatedAt())
                 .url(webhook.getUrl())
-                .eventType(deserializeEventTypes(webhook.getEventType()))
+                .eventTypes(deserializeEventTypes(webhook.getEventType()))
                 .build();
     }
 
@@ -64,7 +69,7 @@ public class WebhookService {
         Webhook webhook = Webhook.builder()
                 .url(request.getUrl())
                 .description(request.getDescription())
-                .eventType(serializeEventTypes(request.getEventType()))
+                .eventType(serializeEventTypes(request.getEventTypes()))
                 .secretKey(SecretKeyGeneratorUtil.generateSecret())
                 .owner(user)
                 .build();
@@ -77,15 +82,11 @@ public class WebhookService {
         return mapToResponse(getOwnedWebhookOrThrow(id, user), false);
     }
 
-    public List<WebhookResponse> getMyWebhooks(User user){
-        List<Webhook> webhooks = webhookRepository.findAllByOwner(user);
-        List<WebhookResponse> webhookResponses = new ArrayList<>();
-        for(Webhook webhook : webhooks){
-            webhookResponses.add(mapToResponse(webhook, false));
-        }
-        return webhookResponses;
+    public List<WebhookResponse> getMyWebhooks(User user) {
+        return webhookRepository.findByOwnerAndDeletedAtIsNull(user).stream()
+                .map(webhook -> mapToResponse(webhook, false))
+                .toList();
     }
-
 
     @Transactional
     public WebhookResponse updateWebhook(Long id, UpdateWebhookRequest request, User user){
@@ -94,8 +95,8 @@ public class WebhookService {
         if (request.getIsActive() != null){
             webhook.setActive(request.getIsActive());
         }
-        if(request.getEventType() != null){
-            webhook.setEventType(serializeEventTypes(request.getEventType()));
+        if(request.getEventTypes() != null){
+            webhook.setEventType(serializeEventTypes(request.getEventTypes()));
         }
         if(request.getDescription() != null){
             webhook.setDescription(request.getDescription());
@@ -109,9 +110,12 @@ public class WebhookService {
     }
 
     @Transactional
-    public void deleteWebhook(Long id, User user){
-        Webhook webhook = getOwnedWebhookOrThrow(id, user);
-        webhookRepository.delete(webhook);
+    public void deleteWebhook(Long id, User user) {
+        Webhook w = getOwnedWebhookOrThrow(id, user);
+        w.setActive(false);
+        w.setDeletedAt(Instant.now());
+        w.setSecretKey(SecretKeyGeneratorUtil.generateSecret());
+        deliveryRepository.cancelOpenDeliveries(w.getId(), DeliveryStatus.CANCELLED, OPEN_STATUSES);
     }
 
     @Transactional

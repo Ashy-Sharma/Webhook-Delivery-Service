@@ -1,0 +1,1 @@
+ALTER TABLE webhooks ADD COLUMN deleted_at TIMESTAMP NULL;

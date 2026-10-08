@@ -19,7 +19,7 @@ public class UpdateWebhookRequest {
     @Length(max = 2048)
     private String url;
 
-    private List<String> eventType;
+    private List<String> eventTypes;
 
     @Length(max = 500)
     private String description;
