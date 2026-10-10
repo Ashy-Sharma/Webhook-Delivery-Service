@@ -13,7 +13,6 @@ import com.projects.webhookdeliveryservice.repository.WebhookRepository;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,7 +30,8 @@ public class EventService {
     private final EventRepository eventRepository;
     private final WebhookRepository webhookRepository;
     private final DeliveryRepository deliveryRepository;
-    private final RabbitTemplate rabbitTemplate;
+    private final ConfirmedRabbitPublisher rabbitPublisher;
+    private final RetryConfig retryConfig;
     private final ObjectMapper objectMapper;
     private static final Logger log = LoggerFactory.getLogger(EventService.class);
 
@@ -60,7 +60,7 @@ public class EventService {
                     .webhook(webhook)
                     .status(DeliveryStatus.PENDING)
                     .attemptCount(0)
-                    .maxAttempts(5)
+                    .maxAttempts(retryConfig.getMaxAttempts())
                     .build());
 
             publishAfterCommit(delivery);
@@ -91,7 +91,7 @@ public class EventService {
                 .payload(event.getPayload())
                 .attemptNumber(delivery.getAttemptCount() + 1)
                 .build();
-        rabbitTemplate.convertAndSend(exchange, routingKey, message);
+        rabbitPublisher.publish(exchange, routingKey, message);
     }
 
 

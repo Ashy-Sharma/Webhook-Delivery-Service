@@ -2,6 +2,7 @@ package com.projects.webhookdeliveryservice.repository;
 
 import com.projects.webhookdeliveryservice.entity.Delivery;
 import com.projects.webhookdeliveryservice.entity.DeliveryStatus;
+import com.projects.webhookdeliveryservice.entity.DeliveryFailureReason;
 import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
@@ -13,6 +14,10 @@ import java.util.Collection;
 import java.util.List;
 
 public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
+
+    long countByStatus(DeliveryStatus status);
+
+    long countByStatusAndFailureReason(DeliveryStatus status, DeliveryFailureReason failureReason);
 
     // Use the database clock here so the MySQL TIMESTAMP comparison does not
     // depend on converting an application Instant into the connection timezone.
@@ -46,59 +51,111 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE Delivery d SET d.status = :delivering, d.claimedAt = :claimedAt, d.nextRetryAt = null, " +
             "d.attemptCount = d.attemptCount + 1 " +
-            "WHERE d.id = :deliveryId AND d.status IN (:claimable) AND d.attemptCount < d.maxAttempts")
+            "WHERE d.id = :deliveryId AND d.status IN (:claimable) " +
+            "AND (d.status <> :retrying OR d.nextRetryAt IS NULL OR d.nextRetryAt <= :claimedAt) " +
+            "AND d.attemptCount < d.maxAttempts")
     int claimForDelivery(@Param("deliveryId") Long deliveryId,
                          @Param("delivering") DeliveryStatus delivering,
                          @Param("claimable") Collection<DeliveryStatus> claimable,
-                         @Param("claimedAt") Instant claimedAt);
+                         @Param("claimedAt") Instant claimedAt,
+                         @Param("retrying") DeliveryStatus retrying);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE Delivery d SET d.status = :failed, d.deliveredAt = null, " +
+    @Query("UPDATE Delivery d SET d.status = :retrying, d.claimedAt = null, d.throttledSince = null, " +
+            "d.failureReason = null, " +
+            "d.nextRetryAt = :nextRetryAt, d.updatedAt = :now " +
+            "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt")
+    int scheduleRetry(@Param("deliveryId") Long deliveryId,
+                      @Param("delivering") DeliveryStatus delivering,
+                      @Param("claimedAt") Instant claimedAt,
+                      @Param("retrying") DeliveryStatus retrying,
+                      @Param("nextRetryAt") Instant nextRetryAt,
+                      @Param("now") Instant now);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Delivery d SET d.status = :retrying, d.failureReason = null, " +
+            "d.attemptCount = d.attemptCount - 1, " +
+            "d.throttleCount = d.throttleCount + 1, " +
+            "d.throttledSince = COALESCE(d.throttledSince, :now), d.claimedAt = null, " +
+            "d.nextRetryAt = :nextRetryAt, d.updatedAt = :now " +
+            "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt " +
+            "AND d.attemptCount > 0 AND (d.throttledSince IS NULL OR d.throttledSince > :throttleDeadline)")
+    int releaseClaimForThrottle(@Param("deliveryId") Long deliveryId,
+                                @Param("delivering") DeliveryStatus delivering,
+                                @Param("claimedAt") Instant claimedAt,
+                                @Param("retrying") DeliveryStatus retrying,
+                                @Param("nextRetryAt") Instant nextRetryAt,
+                                @Param("now") Instant now,
+                                @Param("throttleDeadline") Instant throttleDeadline);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Delivery d SET d.status = :failed, d.failureReason = :failureReason, " +
+            "d.attemptCount = d.attemptCount - 1, " +
+            "d.throttleCount = d.throttleCount + 1, d.claimedAt = null, " +
+            "d.nextRetryAt = null, d.deliveredAt = null, d.throttledSince = null, d.updatedAt = :now " +
+            "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt " +
+            "AND d.attemptCount > 0 AND d.throttledSince IS NOT NULL " +
+            "AND d.throttledSince <= :throttleDeadline")
+    int failDeliveryAfterThrottleAge(@Param("deliveryId") Long deliveryId,
+                                     @Param("delivering") DeliveryStatus delivering,
+                                     @Param("claimedAt") Instant claimedAt,
+                                     @Param("failed") DeliveryStatus failed,
+                                     @Param("failureReason") DeliveryFailureReason failureReason,
+                                     @Param("now") Instant now,
+                                     @Param("throttleDeadline") Instant throttleDeadline);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Delivery d SET d.status = :failed, d.failureReason = :failureReason, " +
+            "d.deliveredAt = null, d.throttledSince = null, " +
             "d.claimedAt = null, d.nextRetryAt = null, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status IN (:claimable) " +
             "AND d.attemptCount >= d.maxAttempts")
     int failExhaustedDelivery(@Param("deliveryId") Long deliveryId,
                               @Param("claimable") Collection<DeliveryStatus> claimable,
                               @Param("failed") DeliveryStatus failed,
+                              @Param("failureReason") DeliveryFailureReason failureReason,
                               @Param("now") Instant now);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE Delivery d SET d.status = :failed, d.deliveredAt = null, " +
+    @Query("UPDATE Delivery d SET d.status = :failed, d.failureReason = :failureReason, " +
+            "d.deliveredAt = null, d.throttledSince = null, " +
             "d.claimedAt = null, d.nextRetryAt = null, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status IN (:claimable)")
     int failUnclaimedDelivery(@Param("deliveryId") Long deliveryId,
                               @Param("claimable") Collection<DeliveryStatus> claimable,
                               @Param("failed") DeliveryStatus failed,
+                              @Param("failureReason") DeliveryFailureReason failureReason,
                               @Param("now") Instant now);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE Delivery d SET d.status = :retrying, d.claimedAt = null, " +
-            "d.nextRetryAt = :nextDispatchAt, d.updatedAt = :now " +
+            "d.throttledSince = null, d.failureReason = null, " +
+            "d.nextRetryAt = :threshold, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt < :threshold")
     int releaseExpiredClaim(@Param("deliveryId") Long deliveryId,
                             @Param("delivering") DeliveryStatus delivering,
                             @Param("retrying") DeliveryStatus retrying,
                             @Param("threshold") Instant threshold,
-                            @Param("nextDispatchAt") Instant nextDispatchAt,
                             @Param("now") Instant now);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE Delivery d SET d.nextRetryAt = :nextDispatchAt, d.updatedAt = :now " +
-            "WHERE d.id = :deliveryId AND d.status = :retrying AND d.nextRetryAt < :threshold")
+    @Query("UPDATE Delivery d SET d.updatedAt = :now " +
+            "WHERE d.id = :deliveryId AND d.status = :retrying AND d.nextRetryAt < :threshold " +
+            "AND d.updatedAt < :threshold")
     int rescheduleRetryDispatch(@Param("deliveryId") Long deliveryId,
                                 @Param("retrying") DeliveryStatus retrying,
                                 @Param("threshold") Instant threshold,
-                                @Param("nextDispatchAt") Instant nextDispatchAt,
                                 @Param("now") Instant now);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE Delivery d SET d.status = :finalStatus, d.deliveredAt = :deliveredAt, " +
-            "d.claimedAt = null, d.updatedAt = :now " +
+    @Query("UPDATE Delivery d SET d.status = :finalStatus, d.failureReason = :failureReason, " +
+            "d.deliveredAt = :deliveredAt, d.claimedAt = null, d.throttledSince = null, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt")
     int finishClaimedDelivery(@Param("deliveryId") Long deliveryId,
                               @Param("delivering") DeliveryStatus delivering,
                               @Param("claimedAt") Instant claimedAt,
                               @Param("finalStatus") DeliveryStatus finalStatus,
+                              @Param("failureReason") DeliveryFailureReason failureReason,
                               @Param("deliveredAt") Instant deliveredAt,
                               @Param("now") Instant now);
 

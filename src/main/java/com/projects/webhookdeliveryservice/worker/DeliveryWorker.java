@@ -4,11 +4,14 @@ import com.rabbitmq.client.Channel;
 import com.projects.webhookdeliveryservice.dto.DeliveryMessage;
 import com.projects.webhookdeliveryservice.dto.DeliveryResult;
 import com.projects.webhookdeliveryservice.entity.Delivery;
+import com.projects.webhookdeliveryservice.entity.DeliveryFailureReason;
 import com.projects.webhookdeliveryservice.entity.Webhook;
 import com.projects.webhookdeliveryservice.exception.UndeliverableDeliveryException;
 import com.projects.webhookdeliveryservice.service.DeliveryLogService;
 import com.projects.webhookdeliveryservice.service.DeliveryService;
 import com.projects.webhookdeliveryservice.service.HmacSignatureService;
+import com.projects.webhookdeliveryservice.service.RateLimitService;
+import com.projects.webhookdeliveryservice.service.RetryService;
 import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -44,6 +47,8 @@ public class DeliveryWorker {
     private final DeliveryService deliveryService;
     private final DeliveryLogService deliveryLogService;
     private final HmacSignatureService hmacSignatureService;
+    private final RateLimitService rateLimitService;
+    private final RetryService retryService;
     private final WebClient webhookWebClient;
 
     @RabbitListener(queues = "${webhook.rabbitmq.delivery-queue}")
@@ -58,7 +63,8 @@ public class DeliveryWorker {
         } catch (UndeliverableDeliveryException exception) {
             if (exception.shouldMarkFailed()) {
                 try {
-                    deliveryService.markUnclaimedFailed(exception.getDeliveryId());
+                    deliveryService.markUnclaimedFailed(exception.getDeliveryId(),
+                            DeliveryFailureReason.UNDELIVERABLE);
                 } catch (Exception statusException) {
                     log.error("Could not mark undeliverable delivery {} as FAILED; requeuing",
                             exception.getDeliveryId(), statusException);
@@ -86,6 +92,34 @@ public class DeliveryWorker {
         DeliveryService.DeliveryAttempt attempt = claimed.get();
         Delivery delivery = attempt.delivery();
         Webhook webhook = attempt.webhook();
+
+        RateLimitService.RateLimitDecision rateLimitDecision;
+        try {
+            rateLimitDecision = rateLimitService.checkAndRecord(webhook.getId());
+        } catch (Exception rateLimitException) {
+            log.error("Could not check rate limit for delivery {}; requeuing before HTTP request",
+                    delivery.getId(), rateLimitException);
+            nackAfterBackoff(channel, deliveryTag);
+            return;
+        }
+
+        if (!rateLimitDecision.allowed()) {
+            try {
+                RetryService.RetryOutcome outcome = retryService.handleThrottled(
+                        attempt, message, rateLimitDecision.waitMillis());
+                if (outcome == RetryService.RetryOutcome.OWNERSHIP_LOST) {
+                    log.warn("Throttled delivery {} is now owned by another process", delivery.getId());
+                }
+            } catch (Exception retryException) {
+                log.error("Could not schedule throttled delivery {}; requeuing for recovery",
+                        delivery.getId(), retryException);
+                nackAfterBackoff(channel, deliveryTag);
+                return;
+            }
+            channel.basicAck(deliveryTag, false);
+            return;
+        }
+
         Map<String, String> headers;
         DeliveryResult result;
         try {
@@ -99,7 +133,8 @@ public class DeliveryWorker {
         } catch (Exception exception) {
             log.error("Could not prepare request for claimed delivery {}", delivery.getId(), exception);
             try {
-                if (!deliveryService.markFailed(delivery.getId(), attempt.claimedAt())) {
+                if (!deliveryService.markFailed(delivery.getId(), attempt.claimedAt(),
+                        DeliveryFailureReason.PREPARATION_ERROR)) {
                     log.warn("Delivery {} is no longer owned by this attempt", delivery.getId());
                 }
             } catch (Exception statusException) {
@@ -126,10 +161,27 @@ public class DeliveryWorker {
                     delivery.getId(), result.statusCode(), result.success(), logException);
         }
 
+        if (!result.success()) {
+            RetryService.RetryOutcome outcome;
+            try {
+                outcome = retryService.handleFailure(attempt, message);
+            } catch (Exception retryException) {
+                log.error("Could not route failed delivery {}; requeuing for recovery",
+                        delivery.getId(), retryException);
+                nackAfterBackoff(channel, deliveryTag);
+                return;
+            }
+            if (outcome == RetryService.RetryOutcome.OWNERSHIP_LOST) {
+                log.warn("Delivery {} was handled by another attempt", delivery.getId());
+            }
+            channel.basicAck(deliveryTag, false);
+            return;
+        }
+
         boolean completionPersisted;
         try {
             completionPersisted = deliveryService.completeAttempt(
-                    delivery.getId(), attempt.claimedAt(), result.success());
+                    delivery.getId(), attempt.claimedAt(), true, null);
         } catch (Exception persistenceException) {
             // The HTTP result is known. Do not convert a successful POST into FAILED;
             // the lease recovery will retry this attempt if persistence remains unavailable.
@@ -140,13 +192,8 @@ public class DeliveryWorker {
         }
 
         if (completionPersisted) {
-            if (result.success()) {
-                log.info("Delivered webhook delivery {} with HTTP status {} in {} ms",
-                        delivery.getId(), result.statusCode(), result.responseTimeMs());
-            } else {
-                log.warn("Webhook delivery {} failed with status {}: {}",
-                        delivery.getId(), result.statusCode(), result.errorMessage());
-            }
+            log.info("Delivered webhook delivery {} with HTTP status {} in {} ms",
+                    delivery.getId(), result.statusCode(), result.responseTimeMs());
             channel.basicAck(deliveryTag, false);
         } else {
             log.warn("Delivery {} is no longer owned by this attempt; another worker is responsible",

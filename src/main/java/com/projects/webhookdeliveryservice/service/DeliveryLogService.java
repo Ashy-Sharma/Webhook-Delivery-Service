@@ -47,6 +47,22 @@ public class DeliveryLogService {
         return deliveryLogRepository.save(log);
     }
 
+    @Transactional
+    public DeliveryLog logThrottleAgeLimitExceeded(Delivery delivery, String requestUrl,
+                                                   long maxThrottleAgeMillis) {
+        String error = "Delivery exceeded the maximum rate-limit wait of " + maxThrottleAgeMillis
+                + " ms since throttling began; no HTTP request was sent";
+        return deliveryLogRepository.save(DeliveryLog.builder()
+                .delivery(delivery)
+                .attemptNumber(0)
+                .requestUrl(requestUrl)
+                .requestHeaders(serializeHeaders(Map.of()))
+                .responseStatus(0)
+                .responseTimeMs(0L)
+                .errorMessage(truncate(error, ERROR_MESSAGE_MAX_LENGTH, "... [truncated]"))
+                .build());
+    }
+
     private String serializeHeaders(Map<String, String> headers) {
         try {
             return objectMapper.writeValueAsString(headers);

@@ -25,6 +25,10 @@ public class Delivery {
     @Column(name = "status", nullable = false)
     private DeliveryStatus status = DeliveryStatus.PENDING;
 
+    @Enumerated(EnumType.STRING)
+    @Column(name = "failure_reason", length = 32)
+    private DeliveryFailureReason failureReason;
+
     @Builder.Default
     @Column(name = "attempt_count", nullable = false)
     private int attemptCount = 0;
@@ -37,11 +41,18 @@ public class Delivery {
     @Column(name = "reconciliation_attempts", nullable = false)
     private int reconciliationAttempts = 0;
 
+    @Builder.Default
+    @Column(name = "throttle_count", nullable = false)
+    private int throttleCount = 0;
+
     @Column(name = "next_retry_at")
     private Instant nextRetryAt;
 
     @Column(name = "claimed_at")
     private Instant claimedAt;
+
+    @Column(name = "throttled_since")
+    private Instant throttledSince;
 
     @Column(name = "delivered_at")
     private Instant deliveredAt;

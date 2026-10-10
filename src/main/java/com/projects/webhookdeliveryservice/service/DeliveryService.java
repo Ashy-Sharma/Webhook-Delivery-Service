@@ -2,6 +2,7 @@ package com.projects.webhookdeliveryservice.service;
 
 import com.projects.webhookdeliveryservice.entity.Delivery;
 import com.projects.webhookdeliveryservice.entity.DeliveryStatus;
+import com.projects.webhookdeliveryservice.entity.DeliveryFailureReason;
 import com.projects.webhookdeliveryservice.entity.Webhook;
 import com.projects.webhookdeliveryservice.exception.UndeliverableDeliveryException;
 import com.projects.webhookdeliveryservice.repository.DeliveryRepository;
@@ -24,15 +25,16 @@ public class DeliveryService {
 
     private final DeliveryRepository deliveryRepository;
     private final WebhookRepository webhookRepository;
+    private final DeliveryLogService deliveryLogService;
 
     @Transactional
     public Optional<DeliveryAttempt> claimAndStartAttempt(Long deliveryId, Long webhookId) {
         Instant claimTime = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         int claimed = deliveryRepository.claimForDelivery(
-                deliveryId, DeliveryStatus.DELIVERING, CLAIMABLE_STATUSES, claimTime);
+                deliveryId, DeliveryStatus.DELIVERING, CLAIMABLE_STATUSES, claimTime, DeliveryStatus.RETRYING);
         if (claimed == 0) {
             deliveryRepository.failExhaustedDelivery(deliveryId, CLAIMABLE_STATUSES,
-                    DeliveryStatus.FAILED, Instant.now());
+                    DeliveryStatus.FAILED, DeliveryFailureReason.HTTP_EXHAUSTED, Instant.now());
             return Optional.empty();
         }
 
@@ -54,24 +56,55 @@ public class DeliveryService {
     }
 
     @Transactional
-    public boolean completeAttempt(Long deliveryId, Instant claimedAt, boolean succeeded) {
+    public boolean completeAttempt(Long deliveryId, Instant claimedAt, boolean succeeded,
+                                   DeliveryFailureReason failureReason) {
         DeliveryStatus finalStatus = succeeded ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED;
         int updated = deliveryRepository.finishClaimedDelivery(deliveryId, DeliveryStatus.DELIVERING,
-                claimedAt, finalStatus, succeeded ? Instant.now() : null, Instant.now());
+                claimedAt, finalStatus, succeeded ? null : failureReason,
+                succeeded ? Instant.now() : null, Instant.now());
         return updated > 0;
     }
 
+
     @Transactional
-    public boolean markFailed(Long deliveryId, Instant claimedAt) {
+    public boolean scheduleRetry(Long deliveryId, Instant claimedAt, Instant nextRetryAt) {
+        return deliveryRepository.scheduleRetry(deliveryId, DeliveryStatus.DELIVERING, claimedAt,
+                DeliveryStatus.RETRYING, nextRetryAt, Instant.now()) > 0;
+    }
+
+    @Transactional
+    public ThrottleReleaseResult releaseClaimForThrottle(
+            DeliveryAttempt attempt, Instant nextRetryAt, Instant throttleDeadline, long maxThrottleAgeMillis) {
+        Long deliveryId = attempt.delivery().getId();
+        Instant claimedAt = attempt.claimedAt();
+        int released = deliveryRepository.releaseClaimForThrottle(deliveryId, DeliveryStatus.DELIVERING,
+                claimedAt, DeliveryStatus.RETRYING, nextRetryAt, Instant.now(), throttleDeadline);
+        if (released > 0) {
+            return ThrottleReleaseResult.REQUEUED;
+        }
+
+        int failed = deliveryRepository.failDeliveryAfterThrottleAge(deliveryId, DeliveryStatus.DELIVERING,
+                claimedAt, DeliveryStatus.FAILED, DeliveryFailureReason.THROTTLE_AGE_EXCEEDED,
+                Instant.now(), throttleDeadline);
+        if (failed > 0) {
+            deliveryLogService.logThrottleAgeLimitExceeded(
+                    attempt.delivery(), attempt.webhook().getUrl(), maxThrottleAgeMillis);
+            return ThrottleReleaseResult.LIMIT_REACHED;
+        }
+        return ThrottleReleaseResult.OWNERSHIP_LOST;
+    }
+
+    @Transactional
+    public boolean markFailed(Long deliveryId, Instant claimedAt, DeliveryFailureReason failureReason) {
         int updated = deliveryRepository.finishClaimedDelivery(deliveryId, DeliveryStatus.DELIVERING,
-                claimedAt, DeliveryStatus.FAILED, null, Instant.now());
+                claimedAt, DeliveryStatus.FAILED, failureReason, null, Instant.now());
         return updated > 0;
     }
 
     @Transactional
-    public boolean markUnclaimedFailed(Long deliveryId) {
+    public boolean markUnclaimedFailed(Long deliveryId, DeliveryFailureReason failureReason) {
         return deliveryRepository.failUnclaimedDelivery(deliveryId, CLAIMABLE_STATUSES,
-                DeliveryStatus.FAILED, Instant.now()) > 0;
+                DeliveryStatus.FAILED, failureReason, Instant.now()) > 0;
     }
 
     @Transactional
@@ -84,16 +117,22 @@ public class DeliveryService {
     public boolean releaseExpiredClaim(Long deliveryId, Instant threshold) {
         Instant now = Instant.now();
         return deliveryRepository.releaseExpiredClaim(deliveryId, DeliveryStatus.DELIVERING,
-                DeliveryStatus.RETRYING, threshold, now.plusSeconds(60), now) > 0;
+                DeliveryStatus.RETRYING, threshold, now) > 0;
     }
 
     @Transactional
     public boolean rescheduleRetryDispatch(Long deliveryId, Instant threshold) {
         Instant now = Instant.now();
         return deliveryRepository.rescheduleRetryDispatch(deliveryId, DeliveryStatus.RETRYING,
-                threshold, now.plusSeconds(60), now) > 0;
+                threshold, now) > 0;
     }
 
     public record DeliveryAttempt(Delivery delivery, Webhook webhook, int attemptNumber, Instant claimedAt) {
+    }
+
+    public enum ThrottleReleaseResult {
+        REQUEUED,
+        LIMIT_REACHED,
+        OWNERSHIP_LOST
     }
 }
