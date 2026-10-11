@@ -5,6 +5,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.time.Instant;
+
 @Data
 @Builder
 @NoArgsConstructor
@@ -16,4 +18,5 @@ public class DeliveryMessage {
     private String eventType;
     private String payload;
     private int attemptNumber;
+    private Instant infrastructureDeferredSince;
 }

@@ -33,6 +33,21 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
     @EntityGraph(attributePaths = {"event", "webhook"})
     List<Delivery> findByStatusAndClaimedAtBefore(DeliveryStatus status, Instant threshold);
 
+    @EntityGraph(attributePaths = {"event", "webhook"})
+    @Query("SELECT d FROM Delivery d WHERE d.id = :deliveryId")
+    java.util.Optional<Delivery> findDetailedById(@Param("deliveryId") Long deliveryId);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Delivery d SET d.status = :pending, d.attemptCount = 0, " +
+            "d.failureReason = null, d.nextRetryAt = null, d.claimedAt = null, " +
+            "d.throttledSince = null, d.infrastructureDeferredSince = null, " +
+            "d.deliveredAt = null, d.updatedAt = :now " +
+            "WHERE d.id = :deliveryId AND d.status = :failed")
+    int resetFailedDeliveryForManualRetry(@Param("deliveryId") Long deliveryId,
+                                          @Param("failed") DeliveryStatus failed,
+                                          @Param("pending") DeliveryStatus pending,
+                                          @Param("now") Instant now);
+
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE Delivery d SET d.reconciliationAttempts = d.reconciliationAttempts + 1 " +
             "WHERE d.id = :deliveryId AND d.status = :pending " +
@@ -40,6 +55,29 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
     int bumpReconciliationAttempt(@Param("deliveryId") Long deliveryId,
                                   @Param("pending") DeliveryStatus pending,
                                   @Param("maxAttempts") int maxAttempts);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Delivery d SET d.infrastructureDeferredSince = COALESCE(" +
+            "d.infrastructureDeferredSince, :deferredSince) WHERE d.id = :deliveryId")
+    int setInfrastructureDeferredSince(@Param("deliveryId") Long deliveryId,
+                                       @Param("deferredSince") Instant deferredSince);
+
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("UPDATE Delivery d SET d.status = :delivering, d.claimedAt = :claimedAt, " +
+            "d.infrastructureDeferredSince = COALESCE(d.infrastructureDeferredSince, :deferredSince), " +
+            "d.nextRetryAt = null, d.updatedAt = :claimedAt " +
+            "WHERE d.id = :deliveryId AND d.webhook.id = :webhookId AND d.status IN (:claimable) " +
+            "AND (d.status <> :retrying OR d.nextRetryAt IS NULL OR d.nextRetryAt <= :claimedAt) " +
+            "AND :deferredSince <= :deadline " +
+            "AND (d.infrastructureDeferredSince IS NULL OR d.infrastructureDeferredSince <= :deadline)")
+    int claimExpiredInfrastructureDeferral(@Param("deliveryId") Long deliveryId,
+                                           @Param("webhookId") Long webhookId,
+                                           @Param("delivering") DeliveryStatus delivering,
+                                           @Param("claimable") Collection<DeliveryStatus> claimable,
+                                           @Param("retrying") DeliveryStatus retrying,
+                                           @Param("claimedAt") Instant claimedAt,
+                                           @Param("deferredSince") Instant deferredSince,
+                                           @Param("deadline") Instant deadline);
 
     @Modifying
     @Query("UPDATE Delivery d SET d.status = :cancelled " +
@@ -62,7 +100,7 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE Delivery d SET d.status = :retrying, d.claimedAt = null, d.throttledSince = null, " +
-            "d.failureReason = null, " +
+            "d.failureReason = null, d.infrastructureDeferredSince = null, " +
             "d.nextRetryAt = :nextRetryAt, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt")
     int scheduleRetry(@Param("deliveryId") Long deliveryId,
@@ -76,7 +114,8 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
     @Query("UPDATE Delivery d SET d.status = :retrying, d.failureReason = null, " +
             "d.attemptCount = d.attemptCount - 1, " +
             "d.throttleCount = d.throttleCount + 1, " +
-            "d.throttledSince = COALESCE(d.throttledSince, :now), d.claimedAt = null, " +
+            "d.throttledSince = COALESCE(d.throttledSince, :now), d.infrastructureDeferredSince = null, " +
+            "d.claimedAt = null, " +
             "d.nextRetryAt = :nextRetryAt, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt " +
             "AND d.attemptCount > 0 AND (d.throttledSince IS NULL OR d.throttledSince > :throttleDeadline)")
@@ -92,7 +131,8 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
     @Query("UPDATE Delivery d SET d.status = :failed, d.failureReason = :failureReason, " +
             "d.attemptCount = d.attemptCount - 1, " +
             "d.throttleCount = d.throttleCount + 1, d.claimedAt = null, " +
-            "d.nextRetryAt = null, d.deliveredAt = null, d.throttledSince = null, d.updatedAt = :now " +
+            "d.nextRetryAt = null, d.deliveredAt = null, d.throttledSince = null, " +
+            "d.infrastructureDeferredSince = null, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt " +
             "AND d.attemptCount > 0 AND d.throttledSince IS NOT NULL " +
             "AND d.throttledSince <= :throttleDeadline")
@@ -105,20 +145,19 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
                                      @Param("throttleDeadline") Instant throttleDeadline);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query("UPDATE Delivery d SET d.status = :failed, d.failureReason = :failureReason, " +
-            "d.deliveredAt = null, d.throttledSince = null, " +
-            "d.claimedAt = null, d.nextRetryAt = null, d.updatedAt = :now " +
-            "WHERE d.id = :deliveryId AND d.status IN (:claimable) " +
-            "AND d.attemptCount >= d.maxAttempts")
-    int failExhaustedDelivery(@Param("deliveryId") Long deliveryId,
-                              @Param("claimable") Collection<DeliveryStatus> claimable,
-                              @Param("failed") DeliveryStatus failed,
-                              @Param("failureReason") DeliveryFailureReason failureReason,
-                              @Param("now") Instant now);
+    @Query("UPDATE Delivery d SET d.status = :delivering, d.claimedAt = :claimedAt, " +
+            "d.nextRetryAt = null, d.updatedAt = :claimedAt " +
+            "WHERE d.id = :deliveryId AND d.webhook.id = :webhookId " +
+            "AND d.status IN (:claimable) AND d.attemptCount >= d.maxAttempts")
+    int claimExhaustedDeliveryForDlq(@Param("deliveryId") Long deliveryId,
+                                    @Param("webhookId") Long webhookId,
+                                    @Param("delivering") DeliveryStatus delivering,
+                                    @Param("claimable") Collection<DeliveryStatus> claimable,
+                                    @Param("claimedAt") Instant claimedAt);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE Delivery d SET d.status = :failed, d.failureReason = :failureReason, " +
-            "d.deliveredAt = null, d.throttledSince = null, " +
+            "d.deliveredAt = null, d.throttledSince = null, d.infrastructureDeferredSince = null, " +
             "d.claimedAt = null, d.nextRetryAt = null, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status IN (:claimable)")
     int failUnclaimedDelivery(@Param("deliveryId") Long deliveryId,
@@ -149,7 +188,8 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query("UPDATE Delivery d SET d.status = :finalStatus, d.failureReason = :failureReason, " +
-            "d.deliveredAt = :deliveredAt, d.claimedAt = null, d.throttledSince = null, d.updatedAt = :now " +
+            "d.deliveredAt = :deliveredAt, d.claimedAt = null, d.throttledSince = null, " +
+            "d.infrastructureDeferredSince = null, d.updatedAt = :now " +
             "WHERE d.id = :deliveryId AND d.status = :delivering AND d.claimedAt = :claimedAt")
     int finishClaimedDelivery(@Param("deliveryId") Long deliveryId,
                               @Param("delivering") DeliveryStatus delivering,

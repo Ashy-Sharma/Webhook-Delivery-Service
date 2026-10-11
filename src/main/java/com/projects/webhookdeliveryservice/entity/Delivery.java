@@ -26,7 +26,7 @@ public class Delivery {
     private DeliveryStatus status = DeliveryStatus.PENDING;
 
     @Enumerated(EnumType.STRING)
-    @Column(name = "failure_reason", length = 32)
+    @Column(name = "failure_reason", length = 48)
     private DeliveryFailureReason failureReason;
 
     @Builder.Default
@@ -53,6 +53,9 @@ public class Delivery {
 
     @Column(name = "throttled_since")
     private Instant throttledSince;
+
+    @Column(name = "infrastructure_deferred_since")
+    private Instant infrastructureDeferredSince;
 
     @Column(name = "delivered_at")
     private Instant deliveredAt;

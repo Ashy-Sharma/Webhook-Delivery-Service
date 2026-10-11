@@ -182,6 +182,54 @@ class WebhookRepositoryIntegrationTest {
     }
 
     @Test
+    void crashExhaustionClaimIsAtomicAndTerminalAuditUsesItsOwnFailureReason() {
+        Event event = Event.builder().eventType("order.created").payload("{}").source("integration-test").build();
+        entityManager.persist(event);
+        Webhook webhook = entityManager.getReference(Webhook.class, orderOnlyWebhookId);
+        Delivery delivery = Delivery.builder()
+                .event(event).webhook(webhook).status(DeliveryStatus.PENDING)
+                .attemptCount(5).maxAttempts(5).build();
+        entityManager.persist(delivery);
+        entityManager.flush();
+
+        Instant claimedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        int wrongWebhook = deliveryRepository.claimExhaustedDeliveryForDlq(delivery.getId(),
+                singleMatchWebhookId, DeliveryStatus.DELIVERING,
+                List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING), claimedAt);
+        assertThat(wrongWebhook).isZero();
+
+        int claimed = deliveryRepository.claimExhaustedDeliveryForDlq(delivery.getId(), orderOnlyWebhookId,
+                DeliveryStatus.DELIVERING, List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING), claimedAt);
+        assertThat(claimed).isEqualTo(1);
+        assertThat(deliveryRepository.claimExhaustedDeliveryForDlq(delivery.getId(), orderOnlyWebhookId,
+                DeliveryStatus.DELIVERING, List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING),
+                claimedAt.plusSeconds(1))).isZero();
+
+        entityManager.clear();
+        Delivery claimedDelivery = deliveryRepository.findDetailedById(delivery.getId()).orElseThrow();
+        assertThat(claimedDelivery.getStatus()).isEqualTo(DeliveryStatus.DELIVERING);
+        assertThat(claimedDelivery.getAttemptCount()).isEqualTo(5);
+        DeliveryLogService logService = new DeliveryLogService(deliveryLogRepository, new ObjectMapper());
+        DeliveryService service = new DeliveryService(deliveryRepository, webhookRepository, logService);
+        DeliveryService.DeliveryAttempt attempt = new DeliveryService.DeliveryAttempt(claimedDelivery,
+                claimedDelivery.getWebhook(), 5, claimedDelivery.getClaimedAt());
+
+        assertThat(service.failCrashExhaustedDelivery(attempt)).isTrue();
+        entityManager.flush();
+        entityManager.clear();
+
+        Delivery terminal = deliveryRepository.findById(delivery.getId()).orElseThrow();
+        assertThat(terminal.getStatus()).isEqualTo(DeliveryStatus.FAILED);
+        assertThat(terminal.getFailureReason()).isEqualTo(DeliveryFailureReason.WORKER_CRASH_EXHAUSTED);
+        assertThat(terminal.getAttemptCount()).isEqualTo(5);
+        DeliveryLog audit = deliveryLogRepository.findAll().stream()
+                .filter(row -> row.getDelivery().getId().equals(delivery.getId())).findFirst().orElseThrow();
+        assertThat(audit.getAttemptNumber()).isZero();
+        assertThat(audit.getResponseStatus()).isNull();
+        assertThat(audit.getErrorMessage()).contains("final subscriber request outcome is unknown");
+    }
+
+    @Test
     void throttleAgeLimitTerminalizesOldDeliveryAndStillRefundsTheUnsentAttempt() {
         Instant claimedAt = Instant.parse("2026-10-08T12:00:00Z");
         Event event = Event.builder()
@@ -411,6 +459,52 @@ class WebhookRepositoryIntegrationTest {
         Delivery rescheduled = deliveryRepository.findById(delivery.getId()).orElseThrow();
         assertThat(updated).isEqualTo(1);
         assertThat(rescheduled.getThrottledSince()).isNull();
+    }
+
+    @Test
+    void manualRetryResetOnlyResetsFailedDeliveriesAndClearsRetryState() {
+        Event event = Event.builder().eventType("order.created").payload("{}").source("integration-test").build();
+        entityManager.persist(event);
+        Delivery failed = Delivery.builder()
+                .event(event)
+                .webhook(entityManager.getReference(Webhook.class, orderOnlyWebhookId))
+                .status(DeliveryStatus.FAILED)
+                .failureReason(DeliveryFailureReason.HTTP_EXHAUSTED)
+                .attemptCount(5)
+                .maxAttempts(5)
+                .claimedAt(Instant.now().minusSeconds(60))
+                .nextRetryAt(Instant.now().minusSeconds(30))
+                .throttledSince(Instant.now().minusSeconds(120))
+                .deliveredAt(Instant.now().minusSeconds(60))
+                .build();
+        Delivery delivered = Delivery.builder()
+                .event(event)
+                .webhook(entityManager.getReference(Webhook.class, orderOnlyWebhookId))
+                .status(DeliveryStatus.DELIVERED)
+                .attemptCount(1)
+                .maxAttempts(5)
+                .deliveredAt(Instant.now())
+                .build();
+        entityManager.persist(failed);
+        entityManager.persist(delivered);
+        entityManager.flush();
+
+        int reset = deliveryRepository.resetFailedDeliveryForManualRetry(
+                failed.getId(), DeliveryStatus.FAILED, DeliveryStatus.PENDING, Instant.now());
+        int deliveredReset = deliveryRepository.resetFailedDeliveryForManualRetry(
+                delivered.getId(), DeliveryStatus.FAILED, DeliveryStatus.PENDING, Instant.now());
+
+        entityManager.clear();
+        Delivery resetDelivery = deliveryRepository.findById(failed.getId()).orElseThrow();
+        assertThat(reset).isEqualTo(1);
+        assertThat(deliveredReset).isZero();
+        assertThat(resetDelivery.getStatus()).isEqualTo(DeliveryStatus.PENDING);
+        assertThat(resetDelivery.getAttemptCount()).isZero();
+        assertThat(resetDelivery.getFailureReason()).isNull();
+        assertThat(resetDelivery.getClaimedAt()).isNull();
+        assertThat(resetDelivery.getNextRetryAt()).isNull();
+        assertThat(resetDelivery.getThrottledSince()).isNull();
+        assertThat(resetDelivery.getDeliveredAt()).isNull();
     }
 
     @Test

@@ -7,6 +7,7 @@ import com.projects.webhookdeliveryservice.entity.Webhook;
 import com.projects.webhookdeliveryservice.exception.UndeliverableDeliveryException;
 import com.projects.webhookdeliveryservice.service.DeliveryLogService;
 import com.projects.webhookdeliveryservice.service.DeliveryService;
+import com.projects.webhookdeliveryservice.service.DeliveryStatsService;
 import com.projects.webhookdeliveryservice.service.HmacSignatureService;
 import com.projects.webhookdeliveryservice.service.RateLimitService;
 import com.projects.webhookdeliveryservice.service.RetryService;
@@ -56,6 +57,7 @@ class DeliveryWorkerTest {
     private final AtomicReference<String> signatureHeader = new AtomicReference<>();
     private DeliveryService deliveryService;
     private DeliveryLogService deliveryLogService;
+    private DeliveryStatsService deliveryStatsService;
     private HmacSignatureService hmacSignatureService;
     private RateLimitService rateLimitService;
     private RetryService retryService;
@@ -81,6 +83,7 @@ class DeliveryWorkerTest {
 
         deliveryService = mock(DeliveryService.class);
         deliveryLogService = mock(DeliveryLogService.class);
+        deliveryStatsService = mock(DeliveryStatsService.class);
         hmacSignatureService = new HmacSignatureService();
         rateLimitService = mock(RateLimitService.class);
         retryService = mock(RetryService.class);
@@ -92,6 +95,7 @@ class DeliveryWorkerTest {
         deliveryWorker = new DeliveryWorker(
                 deliveryService,
                 deliveryLogService,
+                deliveryStatsService,
                 hmacSignatureService,
                 rateLimitService,
                 retryService,
@@ -139,6 +143,7 @@ class DeliveryWorkerTest {
         assertTrue(resultCaptor.getValue().success());
 
         verify(deliveryService).completeAttempt(DELIVERY_ID, CLAIMED_AT, true, null);
+        verify(deliveryStatsService).recordSuccess(eq(WEBHOOK_ID), org.mockito.ArgumentMatchers.anyLong());
         verify(channel).basicAck(11L, false);
     }
 
@@ -160,6 +165,7 @@ class DeliveryWorkerTest {
                 org.mockito.ArgumentMatchers.any(), eq(4_000L));
         verify(channel).basicAck(10L, false);
         verifyNoInteractions(deliveryLogService);
+        verifyNoInteractions(deliveryStatsService);
     }
 
     @Test
@@ -182,12 +188,28 @@ class DeliveryWorkerTest {
         assertEquals(null, resultCaptor.getValue().errorMessage());
 
         verify(retryService).handleFailure(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any());
+        verify(deliveryStatsService, never()).recordFailure(WEBHOOK_ID);
         verify(deliveryService, never()).completeAttempt(
                 org.mockito.ArgumentMatchers.eq(DELIVERY_ID),
                 org.mockito.ArgumentMatchers.eq(CLAIMED_AT),
                 org.mockito.ArgumentMatchers.eq(false),
                 org.mockito.ArgumentMatchers.any());
         verify(channel).basicAck(12L, false);
+    }
+
+    @Test
+    void recordsFailureStatisticsOnlyAfterHttpRetriesAreExhausted() throws IOException {
+        responseStatus.set(500);
+        when(deliveryService.claimAndStartAttempt(DELIVERY_ID, WEBHOOK_ID))
+                .thenReturn(Optional.of(new DeliveryService.DeliveryAttempt(delivery, webhook, 5, CLAIMED_AT)));
+        when(retryService.handleFailure(org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                .thenReturn(RetryService.RetryOutcome.DEAD_LETTERED);
+        Channel channel = mock(Channel.class);
+
+        deliveryWorker.handleDelivery(message(), channel, 21L);
+
+        verify(deliveryStatsService).recordFailure(WEBHOOK_ID);
+        verify(channel).basicAck(21L, false);
     }
 
     @Test
@@ -244,20 +266,65 @@ class DeliveryWorkerTest {
     }
 
     @Test
-    void requeuesWhenClaimCannotBePersisted() throws IOException {
+    void publishesCrashExhaustedDeliveryBeforeAcknowledging() throws IOException {
+        DeliveryService.DeliveryAttempt exhaustedAttempt =
+                new DeliveryService.DeliveryAttempt(delivery, webhook, 5, CLAIMED_AT);
+        when(deliveryService.claimAndStartAttempt(DELIVERY_ID, WEBHOOK_ID)).thenReturn(Optional.empty());
+        when(deliveryService.claimExhaustedDeliveryForDlq(DELIVERY_ID, WEBHOOK_ID))
+                .thenReturn(Optional.of(exhaustedAttempt));
+        when(retryService.handleCrashExhaustion(org.mockito.ArgumentMatchers.same(exhaustedAttempt),
+                org.mockito.ArgumentMatchers.any()))
+                .thenReturn(RetryService.RetryOutcome.CRASH_EXHAUSTED_DEAD_LETTERED);
+        Channel channel = mock(Channel.class);
+
+        deliveryWorker.handleDelivery(message(), channel, 22L);
+
+        assertEquals(0, requestCount.get());
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(retryService, channel);
+        order.verify(retryService).handleCrashExhaustion(org.mockito.ArgumentMatchers.same(exhaustedAttempt),
+                org.mockito.ArgumentMatchers.any());
+        order.verify(channel).basicAck(22L, false);
+        verifyNoInteractions(deliveryStatsService);
+    }
+
+    @Test
+    void defersCrashExhaustionWhenDlqHandlingFails() throws IOException {
+        DeliveryService.DeliveryAttempt exhaustedAttempt =
+                new DeliveryService.DeliveryAttempt(delivery, webhook, 5, CLAIMED_AT);
+        when(deliveryService.claimAndStartAttempt(DELIVERY_ID, WEBHOOK_ID)).thenReturn(Optional.empty());
+        when(deliveryService.claimExhaustedDeliveryForDlq(DELIVERY_ID, WEBHOOK_ID))
+                .thenReturn(Optional.of(exhaustedAttempt));
+        doThrow(new IllegalStateException("publisher confirm failed"))
+                .when(retryService).handleCrashExhaustion(org.mockito.ArgumentMatchers.same(exhaustedAttempt),
+                        org.mockito.ArgumentMatchers.any());
+        Channel channel = mock(Channel.class);
+
+        deliveryWorker.handleDelivery(message(), channel, 23L);
+
+        verify(retryService).deferInfrastructureFailure(org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.same(exhaustedAttempt));
+        verify(channel).basicAck(23L, false);
+        verify(channel, never()).basicNack(23L, false, true);
+        verifyNoInteractions(deliveryStatsService);
+    }
+
+    @Test
+    void defersWhenClaimCannotBePersisted() throws IOException {
         when(deliveryService.claimAndStartAttempt(DELIVERY_ID, WEBHOOK_ID))
                 .thenThrow(new IllegalStateException("database unavailable"));
         Channel channel = mock(Channel.class);
 
         deliveryWorker.handleDelivery(message(), channel, 15L);
 
-        verify(channel).basicNack(15L, false, true);
-        verify(channel, never()).basicAck(15L, false);
+        verify(retryService).deferInfrastructureFailure(org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.isNull());
+        verify(channel).basicAck(15L, false);
+        verify(channel, never()).basicNack(15L, false, true);
         verifyNoInteractions(deliveryLogService);
     }
 
     @Test
-    void requeuesCompletionWriteFailureWithoutMarkingKnownHttpResultFailed() throws IOException {
+    void defersCompletionWriteFailureWithoutMarkingKnownHttpResultFailed() throws IOException {
         when(deliveryService.claimAndStartAttempt(DELIVERY_ID, WEBHOOK_ID))
                 .thenReturn(Optional.of(new DeliveryService.DeliveryAttempt(delivery, webhook, 1, CLAIMED_AT)));
         doThrow(new IllegalStateException("database unavailable"))
@@ -266,8 +333,10 @@ class DeliveryWorkerTest {
 
         deliveryWorker.handleDelivery(message(), channel, 16L);
 
-        verify(channel).basicNack(16L, false, true);
-        verify(channel, never()).basicAck(16L, false);
+        verify(retryService).deferInfrastructureFailure(org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(DeliveryService.DeliveryAttempt.class));
+        verify(channel).basicAck(16L, false);
+        verify(channel, never()).basicNack(16L, false, true);
         verify(deliveryService, never()).markFailed(
                 org.mockito.ArgumentMatchers.eq(DELIVERY_ID),
                 org.mockito.ArgumentMatchers.eq(CLAIMED_AT),
@@ -302,6 +371,7 @@ class DeliveryWorkerTest {
 
         verify(channel).basicAck(18L, false);
         verify(channel, never()).basicNack(18L, false, true);
+        verifyNoInteractions(deliveryStatsService);
         verify(deliveryService, never()).markFailed(
                 org.mockito.ArgumentMatchers.eq(DELIVERY_ID),
                 org.mockito.ArgumentMatchers.eq(CLAIMED_AT),

@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
@@ -51,7 +52,7 @@ public class RateLimitService {
             sortedSets.add(key, now + ":" + UUID.randomUUID(), now);
             redisTemplate.expire(key, Duration.ofMillis(windowMillis * 2));
             return new RateLimitDecision(true, 0, Math.max(0, maxPerWindow - currentCount - 1));
-        } catch (RuntimeException exception) {
+        } catch (DataAccessException exception) {
             log.warn("Redis rate-limit check failed for webhook {}; allowing delivery", webhookId, exception);
             return new RateLimitDecision(true, 0, maxPerWindow);
         }
@@ -73,7 +74,7 @@ public class RateLimitService {
                 return 0;
             }
             return Math.max(0, (long) Math.ceil(oldestScore + windowMillis - now));
-        } catch (RuntimeException exception) {
+        } catch (DataAccessException exception) {
             log.warn("Could not estimate rate-limit wait for {}", key, exception);
             return windowMillis;
         }

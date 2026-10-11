@@ -214,4 +214,5 @@ class RateLimitLoadIntegrationTest {
         assertThat(poisoned).isNotNull();
         assertThat(rabbitAdmin.getQueueInfo("webhook.deliveries").getMessageCount()).isZero();
     }
+
 }

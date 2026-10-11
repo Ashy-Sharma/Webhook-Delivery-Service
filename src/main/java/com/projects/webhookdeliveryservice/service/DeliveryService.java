@@ -33,8 +33,6 @@ public class DeliveryService {
         int claimed = deliveryRepository.claimForDelivery(
                 deliveryId, DeliveryStatus.DELIVERING, CLAIMABLE_STATUSES, claimTime, DeliveryStatus.RETRYING);
         if (claimed == 0) {
-            deliveryRepository.failExhaustedDelivery(deliveryId, CLAIMABLE_STATUSES,
-                    DeliveryStatus.FAILED, DeliveryFailureReason.HTTP_EXHAUSTED, Instant.now());
             return Optional.empty();
         }
 
@@ -53,6 +51,71 @@ public class DeliveryService {
 
         return Optional.of(new DeliveryAttempt(delivery, webhook, delivery.getAttemptCount(),
                 delivery.getClaimedAt()));
+    }
+
+    /**
+     * Takes a fenced claim for terminalizing a delivery whose worker claim budget
+     * is exhausted. This does not increment attemptCount: no new HTTP attempt starts.
+     */
+    @Transactional
+    public Optional<DeliveryAttempt> claimExhaustedDeliveryForDlq(Long deliveryId, Long webhookId) {
+        Instant claimTime = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        int claimed = deliveryRepository.claimExhaustedDeliveryForDlq(deliveryId, webhookId,
+                DeliveryStatus.DELIVERING, CLAIMABLE_STATUSES, claimTime);
+        if (claimed == 0) {
+            return Optional.empty();
+        }
+
+        Delivery delivery = deliveryRepository.findDetailedById(deliveryId)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Claimed crash-exhausted delivery could not be reloaded: " + deliveryId));
+        return Optional.of(new DeliveryAttempt(delivery, delivery.getWebhook(),
+                delivery.getAttemptCount(), delivery.getClaimedAt()));
+    }
+
+    @Transactional
+    public void recordInfrastructureDeferral(Long deliveryId, Instant deferredSince) {
+        deliveryRepository.setInfrastructureDeferredSince(deliveryId, deferredSince);
+    }
+
+    @Transactional
+    public Optional<DeliveryAttempt> claimExpiredInfrastructureDeferral(
+            Long deliveryId, Long webhookId, Instant deferredSince, Instant deadline) {
+        Instant claimTime = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        int claimed = deliveryRepository.claimExpiredInfrastructureDeferral(deliveryId, webhookId,
+                DeliveryStatus.DELIVERING, CLAIMABLE_STATUSES, DeliveryStatus.RETRYING,
+                claimTime, deferredSince, deadline);
+        if (claimed == 0) {
+            return Optional.empty();
+        }
+        Delivery delivery = deliveryRepository.findDetailedById(deliveryId)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Infrastructure-exhausted delivery could not be reloaded: " + deliveryId));
+        return Optional.of(new DeliveryAttempt(delivery, delivery.getWebhook(),
+                delivery.getAttemptCount(), delivery.getClaimedAt()));
+    }
+
+    @Transactional
+    public boolean failInfrastructureDeferredDelivery(DeliveryAttempt attempt) {
+        boolean failed = finishClaimedDelivery(attempt, DeliveryFailureReason.INFRASTRUCTURE_DEFERRAL_EXHAUSTED);
+        if (!failed) {
+            return false;
+        }
+        deliveryLogService.logInfrastructureDeferralExhausted(attempt.delivery(),
+                attempt.webhook().getUrl());
+        return true;
+    }
+
+    /** Persists the crash-exhaustion reason and audit entry in one database transaction. */
+    @Transactional
+    public boolean failCrashExhaustedDelivery(DeliveryAttempt attempt) {
+        boolean failed = finishClaimedDelivery(attempt, DeliveryFailureReason.WORKER_CRASH_EXHAUSTED);
+        if (!failed) {
+            return false;
+        }
+        deliveryLogService.logWorkerCrashExhausted(attempt.delivery(), attempt.webhook().getUrl(),
+                attempt.attemptNumber());
+        return true;
     }
 
     @Transactional
@@ -98,6 +161,13 @@ public class DeliveryService {
     public boolean markFailed(Long deliveryId, Instant claimedAt, DeliveryFailureReason failureReason) {
         int updated = deliveryRepository.finishClaimedDelivery(deliveryId, DeliveryStatus.DELIVERING,
                 claimedAt, DeliveryStatus.FAILED, failureReason, null, Instant.now());
+        return updated > 0;
+    }
+
+    private boolean finishClaimedDelivery(DeliveryAttempt attempt, DeliveryFailureReason failureReason) {
+        int updated = deliveryRepository.finishClaimedDelivery(attempt.delivery().getId(),
+                DeliveryStatus.DELIVERING, attempt.claimedAt(), DeliveryStatus.FAILED,
+                failureReason, null, Instant.now());
         return updated > 0;
     }
 

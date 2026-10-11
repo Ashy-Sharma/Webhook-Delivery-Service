@@ -63,6 +63,35 @@ public class DeliveryLogService {
                 .build());
     }
 
+    @Transactional
+    public DeliveryLog logWorkerCrashExhausted(Delivery delivery, String requestUrl, int claimCount) {
+        String error = "Delivery claim budget exhausted at " + claimCount
+                + "; the final subscriber request outcome is unknown";
+        return deliveryLogRepository.save(DeliveryLog.builder()
+                .delivery(delivery)
+                .attemptNumber(0)
+                .requestUrl(requestUrl)
+                .requestHeaders(serializeHeaders(Map.of()))
+                .responseStatus(null)
+                .responseTimeMs(null)
+                .errorMessage(truncate(error, ERROR_MESSAGE_MAX_LENGTH, "... [truncated]"))
+                .build());
+    }
+
+    @Transactional
+    public DeliveryLog logInfrastructureDeferralExhausted(Delivery delivery, String requestUrl) {
+        String error = "Delivery exceeded the maximum infrastructure deferral age; no HTTP result was persisted";
+        return deliveryLogRepository.save(DeliveryLog.builder()
+                .delivery(delivery)
+                .attemptNumber(0)
+                .requestUrl(requestUrl)
+                .requestHeaders(serializeHeaders(Map.of()))
+                .responseStatus(null)
+                .responseTimeMs(null)
+                .errorMessage(truncate(error, ERROR_MESSAGE_MAX_LENGTH, "... [truncated]"))
+                .build());
+    }
+
     private String serializeHeaders(Map<String, String> headers) {
         try {
             return objectMapper.writeValueAsString(headers);

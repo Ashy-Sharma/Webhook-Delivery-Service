@@ -38,3 +38,22 @@ This is a local development measurement, not a production capacity guarantee.
 Throughput is 0.415/s against a 0.5/s ideal because throttled messages wait in fixed-TTL tiers, not until the exact slot opens.
 The fixed-TTL retry queues still create synchronized retry batches; use the load
 test to compare future scheduling changes under the same settings.
+
+## Day 5 admin operations
+
+Manual retry and event replay endpoints require an account with the `ADMIN` role:
+
+- `POST /api/admin/deliveries/{deliveryId}/retry`
+- `POST /api/admin/events/{eventId}/replay`
+
+Registration intentionally creates `USER` accounts only. For local development,
+promote a test account directly in MySQL after registering it:
+
+```sql
+UPDATE users SET role = 'ADMIN' WHERE email = 'your-test-email@example.com';
+```
+
+Log in again after the role change so the access token contains the `ADMIN`
+authority. Redis counters under `stats:delivery:*` and `stats:webhook:{id}:*`
+are best-effort summaries of terminal HTTP outcomes; MySQL deliveries and logs
+remain the source of truth.

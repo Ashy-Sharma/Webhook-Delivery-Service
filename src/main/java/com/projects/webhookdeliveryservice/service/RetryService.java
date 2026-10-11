@@ -31,13 +31,19 @@ public class RetryService {
     @Value("${webhook.rabbitmq.dlq-queue:webhook.dlq}")
     private String dlqQueueName;
 
-    @Value("${webhook.ratelimit.max-throttle-age-ms:900000}")
+    @Value("${webhook.ratelimit.max-throttle-age-ms:3600000}")
     private long maxThrottleAgeMillis;
+
+    @Value("${webhook.infrastructure.max-deferral-age-ms:300000}")
+    private long maxInfrastructureDeferralAgeMillis;
 
     @PostConstruct
     void validateThrottleLimit() {
         if (maxThrottleAgeMillis < 1) {
             throw new IllegalArgumentException("webhook.ratelimit.max-throttle-age-ms must be at least 1");
+        }
+        if (maxInfrastructureDeferralAgeMillis < 1) {
+            throw new IllegalArgumentException("webhook.infrastructure.max-deferral-age-ms must be at least 1");
         }
     }
 
@@ -70,6 +76,9 @@ public class RetryService {
             return RetryOutcome.OWNERSHIP_LOST;
         }
 
+        // A persisted HTTP result ends the preceding infrastructure-deferral streak.
+        originalMessage.setInfrastructureDeferredSince(null);
+
         String routingKey = retryConfig.getRetryRoutingKey(attemptNumber);
         // The RETRYING row and next_retry_at are committed first. If publish fails,
         // the worker requeues the original message and the existing redispatch scan
@@ -78,6 +87,90 @@ public class RetryService {
         log.warn("Delivery {} failed on attempt {}; routed to {} with {} ms delay",
                 delivery.getId(), attemptNumber, routingKey, delayMillis);
         return RetryOutcome.RETRY_SCHEDULED;
+    }
+
+    /** Publish crash-exhausted work to the DLQ before persisting terminal state. */
+    public RetryOutcome handleCrashExhaustion(DeliveryService.DeliveryAttempt attempt,
+                                              DeliveryMessage originalMessage) {
+        rabbitPublisher.publish(exchange, DLQ_ROUTING_KEY,
+                retryMessage(originalMessage, attempt.attemptNumber()));
+        boolean failed = deliveryService.failCrashExhaustedDelivery(attempt);
+        if (!failed) {
+            log.warn("Crash-exhausted delivery {} lost its claim while routing to the DLQ; " +
+                            "a duplicate DLQ entry is possible", attempt.delivery().getId());
+            return RetryOutcome.OWNERSHIP_LOST;
+        }
+        log.error("Delivery {} exhausted its claim budget at {} and was routed to {}",
+                attempt.delivery().getId(), attempt.attemptNumber(), dlqQueueName);
+        return RetryOutcome.CRASH_EXHAUSTED_DEAD_LETTERED;
+    }
+
+    /**
+     * Moves infrastructure failures away from the hot delivery queue. The longest
+     * configured retry tier bounds repeated database/Redis failures to at most one
+     * redelivery per tier interval while preserving the durable delivery row.
+     */
+    public boolean deferInfrastructureFailure(DeliveryMessage originalMessage,
+                                              DeliveryService.DeliveryAttempt currentAttempt) {
+        Instant deferredSince = originalMessage.getInfrastructureDeferredSince();
+        if (deferredSince == null) {
+            deferredSince = Instant.now();
+            originalMessage.setInfrastructureDeferredSince(deferredSince);
+        }
+        try {
+            deliveryService.recordInfrastructureDeferral(originalMessage.getDeliveryId(), deferredSince);
+        } catch (RuntimeException exception) {
+            // The message carries the timestamp until the database is available again.
+            log.warn("Could not persist infrastructure deferral timestamp for delivery {}; preserving it in " +
+                            "the delayed message", originalMessage.getDeliveryId(), exception);
+        }
+
+        if (isInfrastructureDeferralExpired(originalMessage)) {
+            DeliveryService.DeliveryAttempt terminalAttempt = currentAttempt;
+            if (terminalAttempt == null) {
+                try {
+                    terminalAttempt = deliveryService.claimExpiredInfrastructureDeferral(
+                            originalMessage.getDeliveryId(), originalMessage.getWebhookId(), deferredSince,
+                            infrastructureDeferralDeadline()).orElse(null);
+                } catch (RuntimeException exception) {
+                    log.warn("Could not claim infrastructure-exhausted delivery {}; retrying later",
+                            originalMessage.getDeliveryId(), exception);
+                }
+            }
+
+            if (terminalAttempt != null) {
+                rabbitPublisher.publish(exchange, DLQ_ROUTING_KEY,
+                        retryMessage(originalMessage, terminalAttempt.attemptNumber()));
+                try {
+                    boolean failed = deliveryService.failInfrastructureDeferredDelivery(terminalAttempt);
+                    if (!failed) {
+                        log.warn("Infrastructure-exhausted delivery {} lost its claim after DLQ publish",
+                                originalMessage.getDeliveryId());
+                    } else {
+                        log.error("Delivery {} exceeded the infrastructure deferral age and was routed to {}",
+                                originalMessage.getDeliveryId(), dlqQueueName);
+                    }
+                    return true;
+                } catch (RuntimeException exception) {
+                    log.error("Could not persist infrastructure-exhausted delivery {}; retrying terminal write",
+                            originalMessage.getDeliveryId(), exception);
+                }
+            }
+        }
+
+        int tier = 3;
+        rabbitPublisher.publish(exchange, retryConfig.getRetryRoutingKeyForTier(tier),
+                retryMessage(originalMessage, originalMessage.getAttemptNumber()));
+        return false;
+    }
+
+    public boolean isInfrastructureDeferralExpired(DeliveryMessage message) {
+        Instant since = message.getInfrastructureDeferredSince();
+        return since != null && !since.isAfter(infrastructureDeferralDeadline());
+    }
+
+    public Instant infrastructureDeferralDeadline() {
+        return Instant.now().minusMillis(maxInfrastructureDeferralAgeMillis);
     }
 
     /**
@@ -120,6 +213,8 @@ public class RetryService {
             return RetryOutcome.THROTTLE_LIMIT_REACHED;
         }
 
+        originalMessage.setInfrastructureDeferredSince(null);
+
         String routingKey = retryConfig.getRetryRoutingKeyForTier(tier);
         rabbitPublisher.publish(exchange, routingKey,
                 retryMessage(originalMessage, attempt.attemptNumber()));
@@ -136,6 +231,7 @@ public class RetryService {
                 .eventType(originalMessage.getEventType())
                 .payload(originalMessage.getPayload())
                 .attemptNumber(nextAttemptNumber)
+                .infrastructureDeferredSince(originalMessage.getInfrastructureDeferredSince())
                 .build();
     }
 
@@ -144,6 +240,7 @@ public class RetryService {
         THROTTLE_REQUEUED,
         THROTTLE_LIMIT_REACHED,
         DEAD_LETTERED,
+        CRASH_EXHAUSTED_DEAD_LETTERED,
         OWNERSHIP_LOST
     }
 }

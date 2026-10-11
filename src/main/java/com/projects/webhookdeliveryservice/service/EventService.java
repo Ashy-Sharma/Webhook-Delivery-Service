@@ -7,6 +7,7 @@ import com.projects.webhookdeliveryservice.entity.Delivery;
 import com.projects.webhookdeliveryservice.entity.DeliveryStatus;
 import com.projects.webhookdeliveryservice.entity.Event;
 import com.projects.webhookdeliveryservice.entity.Webhook;
+import com.projects.webhookdeliveryservice.exception.ResourceNotFoundException;
 import com.projects.webhookdeliveryservice.repository.DeliveryRepository;
 import com.projects.webhookdeliveryservice.repository.EventRepository;
 import com.projects.webhookdeliveryservice.repository.WebhookRepository;
@@ -54,17 +55,7 @@ public class EventService {
         List<Webhook> matchingWebhooks = webhookRepository
                 .findActiveWebhooksByEventType(request.getEventType());
 
-        for (Webhook webhook : matchingWebhooks) {
-            Delivery delivery = deliveryRepository.save(Delivery.builder()
-                    .event(savedEvent)
-                    .webhook(webhook)
-                    .status(DeliveryStatus.PENDING)
-                    .attemptCount(0)
-                    .maxAttempts(retryConfig.getMaxAttempts())
-                    .build());
-
-            publishAfterCommit(delivery);
-        }
+        createDeliveriesAndDispatch(savedEvent, matchingWebhooks);
 
         return EventPublishResponse.builder()
                 .eventId(savedEvent.getId())
@@ -72,6 +63,33 @@ public class EventService {
                 .webhooksMatched(matchingWebhooks.size())
                 .deliveriesCreated(matchingWebhooks.size())
                 .build();
+    }
+
+    @Transactional
+    public EventPublishResponse replayEvent(Long eventId) {
+        Event event = eventRepository.findById(eventId)
+                .orElseThrow(() -> new ResourceNotFoundException("Event not found"));
+        List<Webhook> matchingWebhooks = webhookRepository.findActiveWebhooksByEventType(event.getEventType());
+        createDeliveriesAndDispatch(event, matchingWebhooks);
+        return EventPublishResponse.builder()
+                .eventId(event.getId())
+                .eventType(event.getEventType())
+                .webhooksMatched(matchingWebhooks.size())
+                .deliveriesCreated(matchingWebhooks.size())
+                .build();
+    }
+
+    private void createDeliveriesAndDispatch(Event event, List<Webhook> matchingWebhooks) {
+        for (Webhook webhook : matchingWebhooks) {
+            Delivery delivery = deliveryRepository.save(Delivery.builder()
+                    .event(event)
+                    .webhook(webhook)
+                    .status(DeliveryStatus.PENDING)
+                    .attemptCount(0)
+                    .maxAttempts(retryConfig.getMaxAttempts())
+                    .build());
+            publishAfterCommit(delivery);
+        }
     }
 
     private String serializePayload(PublishEventRequest request) {
@@ -90,6 +108,7 @@ public class EventService {
                 .eventType(event.getEventType())
                 .payload(event.getPayload())
                 .attemptNumber(delivery.getAttemptCount() + 1)
+                .infrastructureDeferredSince(delivery.getInfrastructureDeferredSince())
                 .build();
         rabbitPublisher.publish(exchange, routingKey, message);
     }

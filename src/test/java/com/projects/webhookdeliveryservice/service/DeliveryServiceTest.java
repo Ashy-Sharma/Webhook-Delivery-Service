@@ -37,21 +37,38 @@ class DeliveryServiceTest {
     }
 
     @Test
-    void terminalizesDeliveryWhenClaimBudgetIsExhausted() {
+    void leavesClaimBudgetExhaustionForTheFencedDlqFlow() {
         when(deliveryRepository.claimForDelivery(
                 eq(41L), eq(DeliveryStatus.DELIVERING), any(), any(Instant.class), eq(DeliveryStatus.RETRYING)))
                 .thenReturn(0);
-        when(deliveryRepository.failExhaustedDelivery(
-                eq(41L), any(), eq(DeliveryStatus.FAILED),
-                eq(DeliveryFailureReason.HTTP_EXHAUSTED), any(Instant.class)))
-                .thenReturn(1);
-
         Optional<DeliveryService.DeliveryAttempt> result = deliveryService.claimAndStartAttempt(41L, 8L);
 
         assertTrue(result.isEmpty());
-        verify(deliveryRepository).failExhaustedDelivery(
-                eq(41L), eq(List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING)),
-                eq(DeliveryStatus.FAILED), eq(DeliveryFailureReason.HTTP_EXHAUSTED), any(Instant.class));
+        verify(deliveryRepository, org.mockito.Mockito.never()).claimExhaustedDeliveryForDlq(
+                org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void claimsExhaustedDeliveryWithoutIncrementingItsAttemptCount() {
+        Instant claimedAt = Instant.parse("2026-10-08T12:00:00Z");
+        Webhook webhook = Webhook.builder().id(8L).url("https://example.com/hook").build();
+        Delivery delivery = Delivery.builder()
+                .id(41L).status(DeliveryStatus.DELIVERING).attemptCount(5).maxAttempts(5)
+                .claimedAt(claimedAt).webhook(webhook).build();
+        when(deliveryRepository.claimExhaustedDeliveryForDlq(eq(41L), eq(8L),
+                eq(DeliveryStatus.DELIVERING), any(), any(Instant.class))).thenReturn(1);
+        when(deliveryRepository.findDetailedById(41L)).thenReturn(Optional.of(delivery));
+
+        DeliveryService.DeliveryAttempt attempt = deliveryService
+                .claimExhaustedDeliveryForDlq(41L, 8L).orElseThrow();
+
+        assertEquals(5, attempt.attemptNumber());
+        assertEquals(claimedAt, attempt.claimedAt());
+        verify(deliveryRepository).claimExhaustedDeliveryForDlq(eq(41L), eq(8L),
+                eq(DeliveryStatus.DELIVERING), eq(List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING)),
+                any(Instant.class));
     }
 
     @Test

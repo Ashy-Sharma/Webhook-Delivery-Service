@@ -9,6 +9,7 @@ import com.projects.webhookdeliveryservice.entity.Webhook;
 import com.projects.webhookdeliveryservice.exception.UndeliverableDeliveryException;
 import com.projects.webhookdeliveryservice.service.DeliveryLogService;
 import com.projects.webhookdeliveryservice.service.DeliveryService;
+import com.projects.webhookdeliveryservice.service.DeliveryStatsService;
 import com.projects.webhookdeliveryservice.service.HmacSignatureService;
 import com.projects.webhookdeliveryservice.service.RateLimitService;
 import com.projects.webhookdeliveryservice.service.RetryService;
@@ -46,6 +47,7 @@ public class DeliveryWorker {
 
     private final DeliveryService deliveryService;
     private final DeliveryLogService deliveryLogService;
+    private final DeliveryStatsService deliveryStatsService;
     private final HmacSignatureService hmacSignatureService;
     private final RateLimitService rateLimitService;
     private final RetryService retryService;
@@ -57,6 +59,18 @@ public class DeliveryWorker {
             Channel channel,
             @Header(AmqpHeaders.DELIVERY_TAG) long deliveryTag) throws IOException {
 
+        if (message.getInfrastructureDeferredSince() != null) {
+            try {
+                deliveryService.recordInfrastructureDeferral(
+                        message.getDeliveryId(), message.getInfrastructureDeferredSince());
+            } catch (Exception exception) {
+                log.error("Could not persist infrastructure deferral state for delivery {}; deferring message",
+                        message.getDeliveryId(), exception);
+                deferAndAckOrNack(message, channel, deliveryTag);
+                return;
+            }
+        }
+
         Optional<DeliveryService.DeliveryAttempt> claimed;
         try {
             claimed = deliveryService.claimAndStartAttempt(message.getDeliveryId(), message.getWebhookId());
@@ -66,9 +80,9 @@ public class DeliveryWorker {
                     deliveryService.markUnclaimedFailed(exception.getDeliveryId(),
                             DeliveryFailureReason.UNDELIVERABLE);
                 } catch (Exception statusException) {
-                    log.error("Could not mark undeliverable delivery {} as FAILED; requeuing",
+                    log.error("Could not mark undeliverable delivery {} as FAILED; deferring",
                             exception.getDeliveryId(), statusException);
-                    nackAfterBackoff(channel, deliveryTag);
+                    deferAndAckOrNack(message, channel, deliveryTag);
                     return;
                 }
             }
@@ -77,12 +91,37 @@ public class DeliveryWorker {
             channel.basicAck(deliveryTag, false);
             return;
         } catch (Exception exception) {
-            log.error("Could not claim delivery {}; requeuing message", message.getDeliveryId(), exception);
-            nackAfterBackoff(channel, deliveryTag);
+            log.error("Could not claim delivery {}; deferring message", message.getDeliveryId(), exception);
+            deferAndAckOrNack(message, channel, deliveryTag);
             return;
         }
 
         if (claimed.isEmpty()) {
+            Optional<DeliveryService.DeliveryAttempt> exhaustedClaim;
+            try {
+                exhaustedClaim = deliveryService.claimExhaustedDeliveryForDlq(
+                        message.getDeliveryId(), message.getWebhookId());
+            } catch (Exception exception) {
+                log.error("Could not claim crash-exhausted delivery {}; deferring message",
+                        message.getDeliveryId(), exception);
+                deferAndAckOrNack(message, channel, deliveryTag);
+                return;
+            }
+
+            if (exhaustedClaim.isPresent()) {
+                try {
+                    retryService.handleCrashExhaustion(exhaustedClaim.get(), message);
+                } catch (Exception exception) {
+                    log.error("Could not publish crash-exhausted delivery {} to the DLQ; deferring",
+                            message.getDeliveryId(), exception);
+                    deferAndAckOrNack(message, channel, deliveryTag, exhaustedClaim.get());
+                    return;
+                }
+                // The final HTTP outcome is unknown; this is not an HTTP failure statistic.
+                channel.basicAck(deliveryTag, false);
+                return;
+            }
+
             log.info("Skipping duplicate, cancelled, or completed delivery message for delivery {}",
                     message.getDeliveryId());
             channel.basicAck(deliveryTag, false);
@@ -97,9 +136,9 @@ public class DeliveryWorker {
         try {
             rateLimitDecision = rateLimitService.checkAndRecord(webhook.getId());
         } catch (Exception rateLimitException) {
-            log.error("Could not check rate limit for delivery {}; requeuing before HTTP request",
+            log.error("Could not check rate limit for delivery {}; deferring before HTTP request",
                     delivery.getId(), rateLimitException);
-            nackAfterBackoff(channel, deliveryTag);
+            deferAndAckOrNack(message, channel, deliveryTag, attempt);
             return;
         }
 
@@ -111,9 +150,9 @@ public class DeliveryWorker {
                     log.warn("Throttled delivery {} is now owned by another process", delivery.getId());
                 }
             } catch (Exception retryException) {
-                log.error("Could not schedule throttled delivery {}; requeuing for recovery",
+                log.error("Could not schedule throttled delivery {}; deferring for recovery",
                         delivery.getId(), retryException);
-                nackAfterBackoff(channel, deliveryTag);
+                deferAndAckOrNack(message, channel, deliveryTag, attempt);
                 return;
             }
             channel.basicAck(deliveryTag, false);
@@ -138,9 +177,9 @@ public class DeliveryWorker {
                     log.warn("Delivery {} is no longer owned by this attempt", delivery.getId());
                 }
             } catch (Exception statusException) {
-                log.error("Could not mark delivery {} as FAILED; requeuing for lease recovery",
+                log.error("Could not mark delivery {} as FAILED; deferring for lease recovery",
                         delivery.getId(), statusException);
-                nackAfterBackoff(channel, deliveryTag);
+                deferAndAckOrNack(message, channel, deliveryTag, attempt);
                 return;
             }
             channel.basicAck(deliveryTag, false);
@@ -166,13 +205,15 @@ public class DeliveryWorker {
             try {
                 outcome = retryService.handleFailure(attempt, message);
             } catch (Exception retryException) {
-                log.error("Could not route failed delivery {}; requeuing for recovery",
+                log.error("Could not route failed delivery {}; deferring for recovery",
                         delivery.getId(), retryException);
-                nackAfterBackoff(channel, deliveryTag);
+                deferAndAckOrNack(message, channel, deliveryTag, attempt);
                 return;
             }
             if (outcome == RetryService.RetryOutcome.OWNERSHIP_LOST) {
                 log.warn("Delivery {} was handled by another attempt", delivery.getId());
+            } else if (outcome == RetryService.RetryOutcome.DEAD_LETTERED) {
+                deliveryStatsService.recordFailure(webhook.getId());
             }
             channel.basicAck(deliveryTag, false);
             return;
@@ -185,21 +226,43 @@ public class DeliveryWorker {
         } catch (Exception persistenceException) {
             // The HTTP result is known. Do not convert a successful POST into FAILED;
             // the lease recovery will retry this attempt if persistence remains unavailable.
-            log.error("Could not persist HTTP result for delivery {}; leaving claim for recovery",
+            log.error("Could not persist HTTP result for delivery {}; deferring for recovery",
                     delivery.getId(), persistenceException);
-            nackAfterBackoff(channel, deliveryTag);
+            deferAndAckOrNack(message, channel, deliveryTag, attempt);
             return;
         }
 
         if (completionPersisted) {
             log.info("Delivered webhook delivery {} with HTTP status {} in {} ms",
                     delivery.getId(), result.statusCode(), result.responseTimeMs());
+            deliveryStatsService.recordSuccess(webhook.getId(), result.responseTimeMs());
             channel.basicAck(deliveryTag, false);
         } else {
             log.warn("Delivery {} is no longer owned by this attempt; another worker is responsible",
                     delivery.getId());
             channel.basicAck(deliveryTag, false);
         }
+    }
+
+    private void deferAndAckOrNack(DeliveryMessage message, Channel channel, long deliveryTag) throws IOException {
+        deferAndAckOrNack(message, channel, deliveryTag, null);
+    }
+
+    private void deferAndAckOrNack(DeliveryMessage message, Channel channel, long deliveryTag,
+                                   DeliveryService.DeliveryAttempt attempt) throws IOException {
+        try {
+            boolean terminalized = retryService.deferInfrastructureFailure(message, attempt);
+            if (terminalized) {
+                channel.basicAck(deliveryTag, false);
+                return;
+            }
+        } catch (Exception publishException) {
+            log.error("Could not defer delivery {}; falling back to delayed broker requeue",
+                    message.getDeliveryId(), publishException);
+            nackAfterBackoff(channel, deliveryTag);
+            return;
+        }
+        channel.basicAck(deliveryTag, false);
     }
 
     private void nackAfterBackoff(Channel channel, long deliveryTag) throws IOException {
