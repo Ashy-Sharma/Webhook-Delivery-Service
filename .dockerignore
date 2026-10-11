@@ -8,3 +8,4 @@ target
 build
 uploads
 *.iml
+local-load-test

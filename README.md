@@ -13,6 +13,7 @@ A backend service for accepting application events and delivering them asynchron
 - [Webhook signature verification](#webhook-signature-verification)
 - [Monitoring definitions](#monitoring-definitions)
 - [Tests](#tests)
+- [Local delivery benchmark](#local-delivery-benchmark)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations and future work](#known-limitations-and-future-work)
 
@@ -301,6 +302,27 @@ Integration tests use Testcontainers for MySQL, Redis, and RabbitMQ and require 
 ```
 
 The suite includes unit tests, real-MySQL repository tests, and API/worker/recovery integration tests. Postman collections for staged manual verification may be present in `postman_tests/`; that directory is gitignored in this workspace. Set collection/environment variables (API URL, credentials, RabbitMQ management credentials, and a real webhook.site inbox URL where used) before running those collections.
+
+## Local delivery benchmark
+
+Measured on 2026-10-11 using a local Docker Compose stack, 16 delivery consumers, and a test receiver configured for 200 ms response latency. k6 used a constant-arrival-rate event publisher. End-to-end latency is measured from the event's `sentAtMs` (set immediately before the publish API request) to receiver arrival. Throughput is based on unique delivery IDs received successfully, not API acceptance rate.
+
+| Offered rate and duration | Events accepted | Successful receiver throughput | Event-to-receiver latency p50 / p95 / p99 | Correctness result |
+|---|---:|---:|---:|---|
+| 50 events/s for 2 min | 6,001 | 50.01 deliveries/s | 30 / 845 / 1,837 ms | All 6,001 delivery rows reached `DELIVERED`; attempt counts matched audit rows; no overlapping requests for the same delivery ID; all signatures valid. |
+| 75 events/s for 60 s | 4,501 | 66.46 deliveries/s | 4.23 / 7.48 / 7.78 s | All 4,501 delivery rows reached `DELIVERED`; audit checks passed; no overlapping requests; all signatures valid. |
+| 100 events/s for 30 s | 3,001 | 66.52 deliveries/s | 7.63 / 14.42 / 14.99 s | All 3,001 delivery rows reached `DELIVERED`; audit checks passed; no overlapping requests; all signatures valid. |
+
+In these runs, throughput stopped keeping pace with offered load between 50 and 75 events/s, while end-to-end latency rose sharply. This is a result for this local configuration, not a production capacity guarantee. The 50 events/s run completed for two minutes, but its p95 latency shows queueing was present; it should not be described as a latency-flat maximum.
+
+### Recovery and retry checks
+
+- **Worker kill:** During a 10 events/s run, the application container was killed while 16 receiver requests were in flight. After the app became healthy again, all 101 events reached terminal `DELIVERED` state within 68 seconds. The receiver observed 117 requests for 101 unique delivery IDs because interrupted in-flight requests can be retried. There were no overlapping requests for the same delivery ID, and all signatures validated.
+- **Injected receiver failures:** With a 10% deterministic first-request failure rate, all 300 accepted events eventually reached `DELIVERED`. The receiver saw 321 requests, including 21 initial HTTP 500 responses; all 300 unique deliveries later succeeded, with no overlapping requests and no invalid signatures. Retry completion latency had p95 around 60.8 seconds in this run, so this tail should be investigated before presenting retry latency as a performance result.
+
+The overlap check compares receiver request intervals for each `X-Webhook-Delivery-Id`; zero observed overlaps means the test saw no concurrent sends for the same logical delivery. It does not mean exactly-once delivery. The service is at-least-once: a receiver may process a request whose response is lost or times out, after which a later retry can cause the same delivery to be observed again. Baseline database checks also confirmed one delivery row per event/subscription, terminal states after draining, matching attempt counts and audit rows, and no duplicate `(delivery_id, attempt_number)` audit keys. Crash recovery can leave an audit gap for an interrupted attempt that never persisted its log.
+
+These are local measurements from a test harness, not a reproducible performance guarantee for other hardware or deployments. The harness used for these runs is local-only and gitignored.
 
 ## Troubleshooting
 
