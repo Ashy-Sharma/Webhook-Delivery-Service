@@ -220,17 +220,17 @@ Admin endpoints require a user whose persisted role is `ADMIN`. Registration cre
 
 ## Webhook signature verification
 
-Each outbound callback uses the stored webhook secret to calculate an HMAC-SHA256 over the exact UTF-8 payload string sent as the request body. The hexadecimal signature and delivery metadata are sent in these headers:
+Each outbound callback uses the stored webhook secret to calculate an HMAC-SHA256 over the UTF-8 string `timestamp + "." + payload`, where `timestamp` is Unix time in seconds and `payload` is the exact JSON string sent as the request body. `X-Webhook-Signature` uses the format `t=<timestamp>,v1=<hex-signature>`. The timestamp is therefore covered by the HMAC. The worker also sends these delivery headers:
 
 | Header | Meaning |
 |---|---|
-| `X-Webhook-Signature` | Hex-encoded HMAC-SHA256 signature of the raw request body |
+| `X-Webhook-Signature` | `t=<timestamp>,v1=<hex-signature>`; HMAC-SHA256 of `timestamp.payload` |
 | `X-Webhook-Event` | Event type |
 | `X-Webhook-Delivery-Id` | Delivery row identifier; useful for subscriber-side idempotency |
 | `X-Webhook-Timestamp` | Unix timestamp in seconds, generated for the outbound request |
 | `Content-Type` | `application/json` |
 
-Verify the signature against the raw body bytes before parsing and reserializing JSON. Re-serialization may change whitespace or key order and therefore produce a different HMAC. Use `X-Webhook-Delivery-Id` to deduplicate callbacks: retries and crash recovery can result in the same logical delivery reaching a subscriber more than once.
+To verify, extract `t` and `v1` from `X-Webhook-Signature`, compute HMAC-SHA256 over the received timestamp, a literal period, and the exact UTF-8 request body, then compare the hexadecimal result with `v1` using a constant-time comparison. Do not parse and reserialize JSON before verification; changed whitespace or key order changes the signed bytes. The signed timestamp lets a subscriber reject stale requests only if it checks the timestamp against its own freshness window. The service sends the timestamp but does not enforce freshness on the subscriber's behalf. Also use `X-Webhook-Delivery-Id` for deduplication because retries and crash recovery can send the same logical delivery more than once. This header format follows the `t`/`v1` convention, but the custom header and payload protocol are not Stripe-compatible.
 
 ## Monitoring definitions
 
