@@ -34,6 +34,7 @@ public class EventService {
     private final ConfirmedRabbitPublisher rabbitPublisher;
     private final RetryConfig retryConfig;
     private final ObjectMapper objectMapper;
+    private final EventTypeService eventTypeService;
     private static final Logger log = LoggerFactory.getLogger(EventService.class);
 
     @Value("${webhook.rabbitmq.exchange}")
@@ -44,6 +45,8 @@ public class EventService {
 
     @Transactional
     public EventPublishResponse publishEvent(PublishEventRequest request) {
+
+        eventTypeService.validate(request.getEventType());
 
         Event event = Event.builder()
                 .eventType(request.getEventType())

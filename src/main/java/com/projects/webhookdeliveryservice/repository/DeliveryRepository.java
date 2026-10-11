@@ -8,6 +8,8 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 
 import java.time.Instant;
 import java.util.Collection;
@@ -18,6 +20,24 @@ public interface DeliveryRepository extends JpaRepository<Delivery, Long> {
     long countByStatus(DeliveryStatus status);
 
     long countByStatusAndFailureReason(DeliveryStatus status, DeliveryFailureReason failureReason);
+
+    long countByStatusAndFailureReasonIn(DeliveryStatus status, Collection<DeliveryFailureReason> failureReasons);
+
+    long countByStatusAndReconciliationAttemptsGreaterThanEqual(DeliveryStatus status, int attempts);
+
+    @EntityGraph(attributePaths = "event")
+    Page<Delivery> findByWebhook_Id(Long webhookId, Pageable pageable);
+
+    @EntityGraph(attributePaths = "event")
+    Page<Delivery> findByWebhook_IdAndStatus(Long webhookId, DeliveryStatus status, Pageable pageable);
+
+    @EntityGraph(attributePaths = "event")
+    List<Delivery> findTop10ByWebhook_IdOrderByCreatedAtDescIdDesc(Long webhookId);
+
+    @Query(value = "SELECT COALESCE(AVG(response_time_ms), 0) FROM delivery_logs " +
+            "WHERE response_status BETWEEN 200 AND 299 AND response_time_ms IS NOT NULL " +
+            "AND attempt_number > 0 AND created_at >= :since", nativeQuery = true)
+    Double averageSuccessfulLatencySince(@Param("since") Instant since);
 
     // Use the database clock here so the MySQL TIMESTAMP comparison does not
     // depend on converting an application Instant into the connection timezone.

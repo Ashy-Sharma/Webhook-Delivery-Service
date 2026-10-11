@@ -37,6 +37,12 @@ public class GlobalExceptionHandler extends ResponseEntityExceptionHandler{
         return buildErrorResponse(HttpStatus.BAD_REQUEST, exception.getMessage(), request);
     }
 
+    @ExceptionHandler(InvalidEventTypeException.class)
+    public ResponseEntity<ErrorResponse> handleInvalidEventType(InvalidEventTypeException exception,
+                                                                 HttpServletRequest request) {
+        return buildErrorResponse(HttpStatus.BAD_REQUEST, exception.getMessage(), request);
+    }
+
 
     @ExceptionHandler(ResourceNotFoundException.class)
     public ResponseEntity<ErrorResponse> handleResourceNotFound(ResourceNotFoundException exception,

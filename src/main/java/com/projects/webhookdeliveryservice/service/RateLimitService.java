@@ -62,6 +62,21 @@ public class RateLimitService {
         return getWaitUntilNextSlotMillis(key(webhookId), System.currentTimeMillis());
     }
 
+    public long getCurrentUsage(Long webhookId) {
+        long now = System.currentTimeMillis();
+        try {
+            Long count = redisTemplate.opsForZSet().count(key(webhookId), now - windowMillis, now);
+            return count == null ? 0 : count;
+        } catch (DataAccessException exception) {
+            log.warn("Could not read rate-limit usage for webhook {}", webhookId, exception);
+            return 0;
+        }
+    }
+
+    public int getConfiguredLimit() {
+        return maxPerWindow;
+    }
+
     private long getWaitUntilNextSlotMillis(String key, long now) {
         try {
             Set<ZSetOperations.TypedTuple<String>> oldest = redisTemplate.opsForZSet()

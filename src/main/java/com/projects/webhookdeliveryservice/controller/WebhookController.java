@@ -3,8 +3,10 @@ package com.projects.webhookdeliveryservice.controller;
 import com.projects.webhookdeliveryservice.dto.request.CreateWebhookRequest;
 import com.projects.webhookdeliveryservice.dto.request.UpdateWebhookRequest;
 import com.projects.webhookdeliveryservice.dto.response.WebhookResponse;
+import com.projects.webhookdeliveryservice.dto.response.WebhookStatsResponse;
 import com.projects.webhookdeliveryservice.entity.User;
 import com.projects.webhookdeliveryservice.service.WebhookService;
+import com.projects.webhookdeliveryservice.service.DeliveryHistoryService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
@@ -20,6 +22,7 @@ import java.util.List;
 public class WebhookController {
 
     private final WebhookService webhookService;
+    private final DeliveryHistoryService deliveryHistoryService;
 
     @PostMapping
     public ResponseEntity<WebhookResponse> createWebhook(
@@ -63,6 +66,13 @@ public class WebhookController {
             @PathVariable Long id,
             @AuthenticationPrincipal User user){
         return ResponseEntity.status(HttpStatus.OK).body(webhookService.regenerateSecret(id,user));
+    }
+
+    @GetMapping("/{id}/stats")
+    public ResponseEntity<WebhookStatsResponse> getWebhookStats(
+            @PathVariable Long id,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(deliveryHistoryService.getWebhookStats(id, user));
     }
 
 }

@@ -9,8 +9,10 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 /**
- * Best-effort Redis counters for terminal HTTP delivery outcomes. MySQL remains
- * the source of truth; a Redis outage must never change a persisted delivery result.
+ * Best-effort Redis counters for terminal HTTP delivery outcomes. Success is
+ * recorded after a persisted 2xx result; failure is recorded after HTTP retry
+ * exhaustion. These are outcome-cycle counters, not raw HTTP-attempt counts or
+ * unique delivery-row counts. MySQL remains the source of truth.
  */
 @Service
 @RequiredArgsConstructor

@@ -57,3 +57,36 @@ Log in again after the role change so the access token contains the `ADMIN`
 authority. Redis counters under `stats:delivery:*` and `stats:webhook:{id}:*`
 are best-effort summaries of terminal HTTP outcomes; MySQL deliveries and logs
 remain the source of truth.
+
+## Day 6 monitoring APIs
+
+The event catalog is configured with `webhook.event-types`. Webhook creation,
+webhook event-type updates, and new event publication reject types outside this
+list with HTTP 400; replaying an existing event does not revalidate its type.
+`GET /api/event-types` returns the configured list to authenticated users.
+
+Admin monitoring endpoints require the `ADMIN` role:
+
+- `GET /api/admin/dashboard` reports current MySQL delivery rows separately
+  from Redis terminal outcome counters. `retryingDeliveries` is the current
+  `RETRYING` row count; status buckets are not expected to sum to all rows.
+- `GET /api/admin/webhooks/health` reports scores based on Redis terminal
+  success/failure outcome counters and the average of the last 100 successful
+  latencies per webhook. The score is an all-time outcome ratio with a latency
+  penalty, so it can recover slowly after an endpoint is fixed.
+- `GET /api/admin/webhooks/{id}/deliveries` returns paged delivery history;
+  page size is capped at 100 and latest attempt summaries are batch-loaded.
+- `GET /api/admin/deliveries/{id}/logs` returns attempt details with a 200
+  character request-body preview. Add `?includeBody=true` to include the full
+  stored request body.
+
+The dashboard's global latency is the average of non-null response times for
+2xx HTTP attempts from the last 24 hours. `delivery_logs.created_at` is indexed
+for this bounded query. `permanentlyFailedDeliveries` is a current MySQL row
+count for DLQ-routed failure reasons; worker-crash and throttle-age values are
+breakdowns within it. `stuckDeliveries` counts `PENDING` rows at the reconciliation
+attempt cap. These counts are not RabbitMQ queue depths. Per-webhook rate-limit
+usage counts only ZSET scores in the configured active window.
+
+The Day 6 Postman checks are in `postman_tests/webhook-day6.postman_collection.json`.
+The `postman_tests/` directory is git-ignored in this workspace.

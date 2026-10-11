@@ -32,7 +32,8 @@ class EventReplayServiceTest {
     private final ConfirmedRabbitPublisher rabbitPublisher = mock(ConfirmedRabbitPublisher.class);
     private final RetryConfig retryConfig = new RetryConfig();
     private final EventService eventService = new EventService(eventRepository, webhookRepository,
-            deliveryRepository, rabbitPublisher, retryConfig, new ObjectMapper());
+            deliveryRepository, rabbitPublisher, retryConfig, new ObjectMapper(),
+            new EventTypeService("payment.failed"));
 
     @AfterEach
     void clearSynchronization() {
@@ -42,7 +43,7 @@ class EventReplayServiceTest {
     }
 
     @Test
-    void replayCreatesFreshPendingDeliveriesForCurrentlyActiveMatchingWebhooks() {
+    void replayCreatesFreshDeliveriesEvenIfEventTypeIsNoLongerAllowedForNewWrites() {
         ReflectionTestUtils.setField(retryConfig, "maxAttempts", 5);
         ReflectionTestUtils.setField(eventService, "exchange", "webhook.exchange");
         ReflectionTestUtils.setField(eventService, "routingKey", "webhook.deliver");

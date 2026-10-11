@@ -20,4 +20,11 @@ public interface WebhookRepository extends JpaRepository<Webhook, Long> {
     List<Webhook> findActiveWebhooksByEventType(@Param("eventType") String eventType);
 
     Collection<Webhook> findByOwnerAndDeletedAtIsNull(User user);
+
+    @Query("SELECT w FROM Webhook w WHERE w.isActive = true AND w.deletedAt IS NULL")
+    List<Webhook> findAllActiveNotDeleted();
+
+    long countByIsActiveTrueAndDeletedAtIsNull();
+
+    boolean existsByIdAndDeletedAtIsNull(Long id);
 }

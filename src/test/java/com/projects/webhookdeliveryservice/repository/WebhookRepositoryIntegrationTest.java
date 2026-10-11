@@ -21,6 +21,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.mysql.MySQLContainer;
@@ -101,6 +103,43 @@ class WebhookRepositoryIntegrationTest {
         List<Webhook> matches = webhookRepository.findActiveWebhooksByEventType("invoice.paid");
 
         assertThat(matches).extracting(Webhook::getId).containsExactly(singleMatchWebhookId);
+    }
+
+    @Test
+    void historyQueriesBatchLatestLogAndAverageOnlyRecentSuccessfulHttpAttempts() {
+        Event event = Event.builder().eventType("order.created").payload("{}").source("monitoring-test").build();
+        entityManager.persist(event);
+        Webhook webhook = entityManager.getReference(Webhook.class, orderOnlyWebhookId);
+        Delivery delivered = Delivery.builder().event(event).webhook(webhook)
+                .status(DeliveryStatus.DELIVERED).attemptCount(2).maxAttempts(5).build();
+        entityManager.persist(delivered);
+        entityManager.flush();
+
+        entityManager.persist(DeliveryLog.builder().delivery(delivered).attemptNumber(1)
+                .responseStatus(503).responseTimeMs(10_000L).errorMessage("server error").build());
+        entityManager.persist(DeliveryLog.builder().delivery(delivered).attemptNumber(2)
+                .responseStatus(204).responseTimeMs(200L).build());
+        entityManager.flush();
+
+        List<DeliveryLogRepository.LatestDeliveryLogProjection> latest =
+                deliveryLogRepository.findLatestLogsForDeliveries(List.of(delivered.getId()));
+        Double averageSuccessLatency = deliveryRepository.averageSuccessfulLatencySince(Instant.now().minusSeconds(60));
+        List<DeliveryLogRepository.WebhookLastDeliveryProjection> lastDeliveryTimes =
+                deliveryLogRepository.findLastDeliveryTimesForWebhooks(List.of(orderOnlyWebhookId));
+        var page = deliveryRepository.findByWebhook_IdAndStatus(orderOnlyWebhookId, DeliveryStatus.DELIVERED,
+                PageRequest.of(0, 20, Sort.by(Sort.Order.desc("createdAt"))));
+
+        assertThat(latest).hasSize(1);
+        assertThat(latest.get(0).getAttemptNumber()).isEqualTo(2);
+        assertThat(latest.get(0).getResponseStatus()).isEqualTo(204);
+        assertThat(averageSuccessLatency).isEqualTo(200.0);
+        assertThat(lastDeliveryTimes).hasSize(1);
+        assertThat(lastDeliveryTimes.get(0).getWebhookId()).isEqualTo(orderOnlyWebhookId);
+        assertThat(lastDeliveryTimes.get(0).getLastDeliveryAt()).isNotNull();
+        assertThat(webhookRepository.findAllActiveNotDeleted())
+                .extracting(Webhook::getId).contains(orderOnlyWebhookId);
+        assertThat(page.getContent()).extracting(Delivery::getId).contains(delivered.getId());
+        assertThat(page.getContent().get(0).getEvent().getEventType()).isEqualTo("order.created");
     }
 
     @Test

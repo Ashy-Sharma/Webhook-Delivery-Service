@@ -27,6 +27,7 @@ public class WebhookService {
     private final WebhookRepository webhookRepository;
     private final ObjectMapper objectMapper;
     private final DeliveryRepository deliveryRepository;
+    private final EventTypeService eventTypeService;
     private static final List<DeliveryStatus> OPEN_STATUSES = List.of(DeliveryStatus.PENDING, DeliveryStatus.RETRYING);
 
     private List<String> deserializeEventTypes(String json) {
@@ -65,6 +66,8 @@ public class WebhookService {
     @Transactional
     public WebhookResponse createWebhook(CreateWebhookRequest request, User user){
 
+        eventTypeService.validateAll(request.getEventTypes());
+
         Webhook webhook = Webhook.builder()
                 .url(request.getUrl())
                 .description(request.getDescription())
@@ -95,6 +98,7 @@ public class WebhookService {
             webhook.setActive(request.getIsActive());
         }
         if(request.getEventTypes() != null){
+            eventTypeService.validateAll(request.getEventTypes());
             webhook.setEventType(serializeEventTypes(request.getEventTypes()));
         }
         if(request.getDescription() != null){
